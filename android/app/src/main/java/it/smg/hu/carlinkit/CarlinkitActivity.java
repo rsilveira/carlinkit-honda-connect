@@ -63,6 +63,13 @@ public final class CarlinkitActivity extends Activity
     /** True between requestPermission and the answer: the system dialog steals the focus
      *  and must not be mistaken for the user leaving the app. */
     private volatile boolean awaitingUsbPermission;
+    /**
+     * USB permission is granted per device instance, and this dongle re-enumerates often,
+     * so the dialog cannot be avoided on this head unit. The dialog was also observed
+     * dismissing itself, leaving the app stuck until reopened — hence the retry.
+     */
+    private int usbPermissionAttempts;
+    private static final int MAX_USB_PERMISSION_ATTEMPTS = 3;
 
     private final BroadcastReceiver usbReceiver = new BroadcastReceiver() {
         @Override
@@ -74,9 +81,23 @@ public final class CarlinkitActivity extends Activity
                 awaitingUsbPermission = false;
                 logBoth("USB permission " + (granted ? "granted" : "DENIED"));
                 if (granted && device != null) {
+                    usbPermissionAttempts = 0;
                     openDevice(device);
+                } else if (usbPermissionAttempts < MAX_USB_PERMISSION_ATTEMPTS) {
+                    // The dialog can dismiss itself here; ask again instead of leaving the
+                    // app waiting for the user to reopen it.
+                    logBoth("permission denied on attempt " + usbPermissionAttempts
+                            + " — asking again");
+                    setStatus("USB permission denied — asking again");
+                    surfaceView.postDelayed(new Runnable() {
+                        @Override
+                        public void run() {
+                            findAndOpenDongle();
+                        }
+                    }, 1500);
                 } else {
-                    setStatus("USB permission denied");
+                    logBoth("giving up after " + usbPermissionAttempts + " attempts");
+                    setStatus("USB permission denied.\nClose and reopen the app to retry.");
                 }
             } else if (UsbManager.ACTION_USB_DEVICE_DETACHED.equals(action)) {
                 UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
@@ -197,6 +218,8 @@ public final class CarlinkitActivity extends Activity
     @Override
     protected void onResume() {
         super.onResume();
+        // Fresh foreground: allow asking for USB permission again from scratch
+        usbPermissionAttempts = 0;
         // The app is in the foreground: any previous exit (including going to the
         // Settings) no longer applies.
         if (userLeft) {
@@ -358,6 +381,7 @@ public final class CarlinkitActivity extends Activity
                 } else {
                     setStatus("requesting USB permission...\ncheck \"use by default\"");
                     awaitingUsbPermission = true;
+                    usbPermissionAttempts++;
                     PendingIntent pi = PendingIntent.getBroadcast(this, 0,
                             new Intent(ACTION_USB_PERMISSION), 0);
                     usbManager.requestPermission(d, pi);
