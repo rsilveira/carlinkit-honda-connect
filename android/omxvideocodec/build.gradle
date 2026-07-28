@@ -1,0 +1,62 @@
+plugins {
+    alias(libs.plugins.android.library)
+}
+
+android {
+    namespace 'it.smg.libs.omxvideocodec'
+
+    compileSdk rootProject.ext.compileSdk
+
+    defaultConfig {
+        minSdkVersion rootProject.ext.minSdk
+        //noinspection ExpiredTargetSdkVersion
+        targetSdkVersion rootProject.ext.targetSdk
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        consumerProguardFiles "consumer-rules.pro"
+
+        externalNativeBuild {
+            ndkBuild {
+                arguments "NDK_APPLICATION_MK=src/main/cpp/Application.mk", "NDK_OUT=${projectDir.path.replace('\\', '/')}/build/intermediates/cxx"
+                abiFilters rootProject.ext.SupportedABIs.join(", ")
+//                targets  "omxvideocodec-jni"
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+
+        }
+
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    externalNativeBuild {
+        ndkBuild {
+            path 'src/main/cpp/Android.mk'
+        }
+    }
+
+    buildFeatures {
+        prefab true
+    }
+
+    ndkVersion rootProject.ext.ndkVersion
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+dependencies {
+    implementation libs.appcompat
+    implementation project(path: ':common')
+    testImplementation libs.junit
+    androidTestImplementation libs.ext.junit
+    androidTestImplementation libs.espresso.core
+}

@@ -1,0 +1,73 @@
+plugins {
+    alias(libs.plugins.android.library)
+}
+
+android {
+    namespace 'it.smg.libs.common'
+
+    compileSdk rootProject.ext.compileSdk
+
+    defaultConfig {
+        minSdkVersion rootProject.ext.minSdk
+        //noinspection ExpiredTargetSdkVersion
+        targetSdkVersion rootProject.ext.targetSdk
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        consumerProguardFiles "consumer-rules.pro"
+
+        externalNativeBuild {
+            ndkBuild {
+                arguments "NDK_APPLICATION_MK=src/main/cpp/Application.mk", "NDK_OUT=${projectDir.path.replace('\\', '/')}/build/intermediates/cxx"
+                abiFilters rootProject.ext.SupportedABIs.join(", ")
+//                targets  "common"
+            }
+        }
+
+    }
+
+    buildTypes {
+        debug {
+
+        }
+
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    externalNativeBuild {
+        ndkBuild {
+            path 'src/main/cpp/Android.mk'
+        }
+    }
+
+    buildFeatures {
+        prefabPublishing true
+//        buildConfig false
+    }
+
+    prefab {
+        common {
+            libraryName "libcommon"
+            headers "src/main/cpp/include"
+        }
+    }
+
+    packagingOptions {
+//        exclude("**/libcommon.so")
+        exclude("**/libc++_shared.so")
+    }
+
+    ndkVersion rootProject.ext.ndkVersion
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+}
+
+dependencies {
+    implementation libs.appcompat
+}

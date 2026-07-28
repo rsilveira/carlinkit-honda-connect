@@ -1,0 +1,83 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    // Os fontes extraidos vivem em it.smg.hu e usam o R desse pacote.
+    namespace 'it.smg.hu'
+
+    compileSdk rootProject.ext.compileSdk
+
+    defaultConfig {
+        // NAO ALTERAR: a whitelist da central (HondaPermissions) e indexada por
+        // package name e ja esta configurada para it.smg.hu.carlinkit.
+        applicationId "it.smg.hu.carlinkit"
+        minSdkVersion rootProject.ext.minSdk
+        //noinspection ExpiredTargetSdkVersion
+        targetSdkVersion rootProject.ext.targetSdk
+        versionCode rootProject.ext.versionCode
+        versionName rootProject.ext.versionName
+        multiDexEnabled true
+
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+
+        android.applicationVariants.all { variant ->
+            variant.outputs.all {
+                // A central Honda so instala arquivo chamado exatamente
+                // "HondaAppCenter_A1.apk" — o arquivo ja sai pronto para copiar ao pendrive.
+                outputFileName = rootProject.apkName + ".apk"
+            }
+        }
+
+        buildFeatures {
+            aidl = true;
+        }
+    }
+
+    splits {
+        abi {
+            enable true
+            reset()
+            //noinspection ChromeOsAbiSupport
+            include rootProject.ext.SupportedABIs.join(", ")
+            universalApk false
+        }
+    }
+
+    buildTypes {
+        debug {
+        }
+
+        release {
+            signingConfig debug.signingConfig
+            // ProGuard fica DESLIGADO de proposito: o JNI usa GetDirectBufferAddress e as
+            // interfaces AIDL da Fujitsu sao resolvidas por nome — ofuscar quebra ambos.
+            minifyEnabled false
+        }
+    }
+
+    ndkVersion rootProject.ext.ndkVersion
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+}
+
+dependencies {
+    compileOnly files('../ext-libs/framework/ada-ext-api.jar')
+
+    implementation libs.appcompat
+    implementation libs.material
+    implementation libs.constraintlayout
+    implementation libs.multidex
+    implementation libs.localbroadcastmanager
+
+    implementation project(path: ':common')
+    implementation project(path: ':omxvideocodec')
+    implementation project(path: ':carlinkit')
+
+    testImplementation libs.junit
+    androidTestImplementation libs.ext.junit
+    androidTestImplementation libs.espresso.core
+}

@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Single manifest of the standalone Carlinkit app.
+
+     Result of merging the fork's app/src/main/AndroidManifest.xml with the
+     app/src/carlinkit/AndroidManifest.xml flavor overlay. There are no flavors here, so
+     everything the flavor removed with tools:node="remove" (MainActivity, PlayerActivity,
+     ODAService, ExitWidget) is simply absent, and no tools: namespace is needed.
+
+     minSdk/targetSdk come from build.gradle (minSdk 15, targetSdk 15), same as the fork:
+     no <uses-sdk> here on purpose, or AGP would complain about the duplicate. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- USB host: the dongle is a device, not an accessory. The AOAP accessory feature
+         (required="true" in the fork) was dropped together with the Android Auto cable
+         mode. -->
+    <uses-feature android:name="android.hardware.usb.host" android:required="false"/>
+    <!-- DayNightSensor in TIME/GPS mode reads the location to work out sunrise/sunset -->
+    <uses-feature android:name="android.hardware.location.gps" android:required="false"/>
+
+    <!-- Bluetooth: the Carlinkit protocol announces the HFP/A2DP configuration to the
+         phone (see Settings.Connectivity) -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:required="false" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:required="false" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+
+    <!-- WiFi/network: advanced.enabledWifi() and the dongle's WiFi pairing -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" android:required="false"/>
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" android:required="false"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" android:required="false"/>
+    <uses-permission android:name="android.permission.INTERNET" android:required="false"/>
+
+    <!-- CarlinkitMicrophone (voice recognition on the phone) -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" android:required="false"/>
+
+    <!-- DayNightSensor / TwilightCalculator -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" android:required="false" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:required="false" />
+
+    <!-- CarlinkitFileLog and ODALog: the head unit has no adb, everything goes to a file -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:required="false" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:required="false" />
+    <uses-permission android:name="android.permission.READ_LOGS" android:required="false" />
+
+    <!-- Honda/Fujitsu head unit services: steering wheel, day/night, audio focus -->
+    <uses-permission android:name="android.permission.ADA_SERVICE_ACCESS" android:required="false" />
+
+    <!-- CarlinkitService runs in the foreground so it survives the screen closing -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- No code acquires a WakeLock today (the Activity uses FLAG_KEEP_SCREEN_ON);
+         declared because the projection must not be interrupted by the head unit. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application android:label="@string/app_name_carlinkit"
+        android:name=".ODAApplication"
+        android:icon="@drawable/logo"
+        android:hardwareAccelerated="true"
+        android:theme="@style/Theme.AppCompat">
+
+        <!-- Main screen: video/audio/touch from the dongle.
+             NO USB_DEVICE_ATTACHED intent-filter here, on purpose. When leaving the app it
+             releases the dongle, the head unit re-enumerates the device and the intent
+             used to relaunch the Activity — preventing FM radio listening. The filter
+             lives on CarlinkitUsbReceiver only. -->
+        <activity android:name=".carlinkit.CarlinkitActivity"
+            android:label="@string/app_name_carlinkit"
+            android:screenOrientation="landscape"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|keyboardHidden|screenSize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Second launcher icon: without it there is no way to adjust steeringWheelIdx /
+             modeMgrAudioIdx and the keymap directly on the head unit — there is no adb
+             here. (A long press on the status also opens it.) -->
+        <activity android:name=".ui.SettingsActivity"
+            android:label="@string/app_name_carlinkit_settings"
+            android:screenOrientation="landscape">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Owner of the USB connection: it survives the screen being closed so the dongle
+             is not re-enumerated (which would require USB permission again on every
+             return). -->
+        <service android:name=".carlinkit.CarlinkitService"
+            android:exported="false" />
+
+        <!-- Lets Android offer "use by default for this device" and grant persistent USB
+             permission. The receiver does not open the Activity on purpose. -->
+        <receiver android:name=".carlinkit.CarlinkitUsbReceiver" android:exported="true">
+            <intent-filter>
+                <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
+            </intent-filter>
+            <meta-data android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED"
+                android:resource="@xml/carlinkit_device_filter" />
+        </receiver>
+
+    </application>
+</manifest>

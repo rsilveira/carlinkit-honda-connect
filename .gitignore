@@ -1,0 +1,36 @@
+# Ambiente Python das ferramentas de análise
+venv/
+__pycache__/
+*.pyc
+
+# Binário proprietário extraído do dongle (Carlinkit).
+# Mantido localmente para análise; NÃO redistribuir — é software de terceiro.
+BoxHelper.apk
+*.apk
+
+# Clone de referência (node-CarPlay, MIT, de rhysmorgan134).
+# Não vendorizar: clonar sob demanda. Ver docs/FINDINGS.md.
+reference/node-CarPlay/
+
+# Capturas de USB e logs de depuração podem conter identificadores do
+# dispositivo e do telefone pareado
+*.pcap
+*.pcapng
+*.log
+captures/
+
+# Documentação de terceiros baixada para consulta (cmdroid.com / cmhonda.net).
+# Não redistribuir: material com autoria identificada. Baixar de
+# http://www.cmdroid.com/tutorials (atenção: só HTTP, https falha).
+reference/cmdroid/
+
+# Proprietary Fujitsu Ten framework — see docs/FUJITSU-DEPENDENCY.md
+android/ext-libs/framework/ada-ext-api.jar
+
+# Gradle / Android build output
+android/build/
+android/*/build/
+android/*/.cxx/
+android/.gradle/
+android/local.properties
+*.apk
