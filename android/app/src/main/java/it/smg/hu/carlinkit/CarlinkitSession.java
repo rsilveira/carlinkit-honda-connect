@@ -2,8 +2,7 @@ package it.smg.hu.carlinkit;
 
 import android.hardware.usb.UsbDevice;
 import android.hardware.usb.UsbDeviceConnection;
-import android.view.MotionEvent;
-import android.view.SurfaceView;
+import android.view.Surface;
 
 import it.smg.libs.carlinkit.AudioMessage;
 import it.smg.libs.carlinkit.CarlinkitDriver;
@@ -20,7 +19,7 @@ import it.smg.libs.common.Log;
  * <pre>
  *   session = new CarlinkitSession(surfaceView, 20);
  *   session.start(usbDevice, usbConnection);
- *   // forward touches:                session.onTouch(event)
+ *   // forward touches:                session.sendTouch(action, x, y)
  *   // forward steering wheel buttons: session.onSteeringWheelKey(keyType)
  *   session.stop();
  * </pre>
@@ -51,7 +50,8 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
         boolean onMicRequested(boolean start);
     }
 
-    private volatile SurfaceView surfaceView;
+    private volatile int surfaceWidth;
+    private volatile int surfaceHeight;
     private final CarlinkitVideoRenderer video;
     private final CarlinkitAudioPlayer audio;
     private CarlinkitMicrophone mic;
@@ -71,16 +71,18 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
      * Attaches the Activity surface. Called when the screen appears; the dongle stays
      * connected when it goes away, so that no USB re-enumeration happens.
      */
-    public void attachSurface(SurfaceView view) {
-        this.surfaceView = view;
-        video.setSurfaceView(view);
+    public void attachSurface(Surface surface, int width, int height) {
+        this.surfaceWidth = width;
+        this.surfaceHeight = height;
+        video.setSurface(surface, width, height);
     }
 
     /** Detaches the surface and the audio, keeping the USB connection and heartbeat alive. */
     public void detachSurface() {
         video.stop();
-        video.setSurfaceView(null);
-        this.surfaceView = null;
+        video.setSurface(null, 0, 0);
+        this.surfaceWidth = 0;
+        this.surfaceHeight = 0;
         surfaceReady = false;
         audio.setMuted(true);
     }
@@ -103,8 +105,8 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
         }
         CarlinkitDriver.Config cfg = new CarlinkitDriver.Config();
         // The resolution comes from the Surface: avoids hardcoding and adapts to any head unit
-        int w = surfaceView != null ? surfaceView.getWidth() : 0;
-        int h = surfaceView != null ? surfaceView.getHeight() : 0;
+        int w = surfaceWidth;
+        int h = surfaceHeight;
         if (w > 0 && h > 0) {
             cfg.width = w;
             cfg.height = h;
@@ -169,34 +171,17 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
     }
 
     /** Forwards a SurfaceView touch to the phone. */
-    public boolean onTouch(MotionEvent event) {
+    /**
+     * Sends a touch already normalised to 0..1. The Activity does the conversion because it
+     * owns the MotionEvent; sending the event itself across the Binder would be wasteful.
+     *
+     * @param action one of {@link CarlinkitProtocol.TouchAction}
+     */
+    public boolean sendTouch(int action, float xRatio, float yRatio) {
         if (driver == null) {
             return false;
         }
-        int action;
-        switch (event.getActionMasked()) {
-            case MotionEvent.ACTION_DOWN:
-                action = CarlinkitProtocol.TouchAction.DOWN;
-                break;
-            case MotionEvent.ACTION_MOVE:
-                action = CarlinkitProtocol.TouchAction.MOVE;
-                break;
-            case MotionEvent.ACTION_UP:
-            case MotionEvent.ACTION_CANCEL:
-                action = CarlinkitProtocol.TouchAction.UP;
-                break;
-            default:
-                return false;
-        }
-        if (surfaceView == null) {
-            return false;
-        }
-        int w = surfaceView.getWidth();
-        int h = surfaceView.getHeight();
-        if (w <= 0 || h <= 0) {
-            return false;
-        }
-        return driver.sendTouch(action, event.getX() / w, event.getY() / h);
+        return driver.sendTouch(action, xRatio, yRatio);
     }
 
     /**

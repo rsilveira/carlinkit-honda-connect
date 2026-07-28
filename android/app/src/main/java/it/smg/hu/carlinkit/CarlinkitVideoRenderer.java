@@ -1,6 +1,6 @@
 package it.smg.hu.carlinkit;
 
-import android.view.SurfaceView;
+import android.view.Surface;
 
 import java.nio.ByteBuffer;
 
@@ -32,7 +32,9 @@ public final class CarlinkitVideoRenderer {
 
     private static final String TAG = "CarlinkitVideo";
 
-    private volatile SurfaceView surfaceView;
+    private volatile Surface surface;
+    private volatile int surfaceWidth;
+    private volatile int surfaceHeight;
     private final int fps;
 
     private OMXVideoCodec codec;
@@ -50,14 +52,14 @@ public final class CarlinkitVideoRenderer {
      * the Service and outlives the Activity; the Surface is the only resource that belongs
      * to the UI.
      */
-    public synchronized void setSurfaceView(SurfaceView view) {
-        this.surfaceView = view;
+    public synchronized void setSurface(Surface surface, int width, int height) {
+        this.surface = surface;
+        this.surfaceWidth = width;
+        this.surfaceHeight = height;
     }
 
     public synchronized boolean hasSurface() {
-        return surfaceView != null
-                && surfaceView.getHolder().getSurface() != null
-                && surfaceView.getHolder().getSurface().isValid();
+        return surface != null && surface.isValid() && surfaceWidth > 0 && surfaceHeight > 0;
     }
 
     public synchronized boolean start() {
@@ -70,8 +72,7 @@ public final class CarlinkitVideoRenderer {
         }
         try {
             codec = new OMXVideoCodec(fps);
-            codec.setSurface(surfaceView.getHolder().getSurface(),
-                    surfaceView.getWidth(), surfaceView.getHeight());
+            codec.setSurface(surface, surfaceWidth, surfaceHeight);
             if (!codec.init()) {
                 Log.e(TAG, "OMXVideoCodec.init() failed");
                 codec = null;
@@ -79,8 +80,8 @@ public final class CarlinkitVideoRenderer {
             }
             running = true;
             frames = 0;
-            Log.i(TAG, "decoder started (" + surfaceView.getWidth() + "x"
-                    + surfaceView.getHeight() + " @" + fps + "fps)");
+            Log.i(TAG, "decoder started (" + surfaceWidth + "x" + surfaceHeight
+                    + " @" + fps + "fps)");
             return true;
         } catch (Throwable t) {
             Log.e(TAG, "failed to start the decoder", t);

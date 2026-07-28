@@ -9,19 +9,19 @@ import android.content.ComponentName;
 import android.content.IntentFilter;
 import android.content.ServiceConnection;
 import android.hardware.usb.UsbDevice;
-import android.hardware.usb.UsbDeviceConnection;
 import android.hardware.usb.UsbManager;
 import android.os.Bundle;
 import android.os.IBinder;
+import android.os.RemoteException;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
+import android.view.Surface;
 import android.view.SurfaceHolder;
 import android.view.SurfaceView;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowManager;
 import android.widget.TextView;
-import android.widget.Toast;
 
 import java.util.HashMap;
 
@@ -38,12 +38,17 @@ import it.smg.libs.common.Log;
  *
  * Responsibilities:
  *  - locate the dongle and obtain USB permission
- *  - keep the {@link CarlinkitSession} alive (video, audio, touch)
- *  - forward the head unit steering wheel buttons
+ *  - lend the Surface to {@link CarlinkitService} and forward touches
+ *  - forward the head unit steering wheel buttons and the microphone requests
  *  - log everything to a file, since the head unit has no adb
+ *
+ * <p>The session itself lives in the service, which runs in the {@code :usb} process so the
+ * USB connection survives the head unit killing this process. Every call to it therefore
+ * goes through AIDL ({@link ICarlinkitService}) and may throw {@link RemoteException}; the
+ * {@code svc*} helpers below keep the call sites readable.
  */
 public final class CarlinkitActivity extends Activity
-        implements SurfaceHolder.Callback, CarlinkitSession.Callback,
+        implements SurfaceHolder.Callback,
         HondaConnectManager.HondaListener, ServiceConnection {
 
     private static final String TAG = "CarlinkitActivity";
@@ -51,7 +56,7 @@ public final class CarlinkitActivity extends Activity
 
     private SurfaceView surfaceView;
     private TextView statusView;
-    private CarlinkitService service;
+    private ICarlinkitService service;
     private UsbManager usbManager;
     private boolean serviceBound;
     private boolean sessionStarted;
@@ -70,6 +75,41 @@ public final class CarlinkitActivity extends Activity
      */
     private int usbPermissionAttempts;
     private static final int MAX_USB_PERMISSION_ATTEMPTS = 3;
+
+    /**
+     * Events coming back from the service. These arrive on a Binder thread, so anything
+     * touching views goes through {@link #setStatus(String)}/{@link #hideStatus()}, which
+     * already post to the UI thread.
+     */
+    private final ICarlinkitCallback.Stub serviceCallback = new ICarlinkitCallback.Stub() {
+
+        @Override
+        public void onPhoneConnected(int phoneType) {
+            final String kind = phoneType == 5 ? "Android Auto"
+                    : phoneType == 3 ? "CarPlay" : "type " + phoneType;
+            logBoth("phone connected: " + kind);
+            phoneConnected = true;
+            hideStatus();
+        }
+
+        @Override
+        public void onPhoneDisconnected() {
+            logBoth("phone disconnected");
+            phoneConnected = false;
+            setStatus("phone disconnected");
+        }
+
+        @Override
+        public void onStatus(String status) {
+            logBoth("state: " + status);
+            setStatus(status);
+        }
+
+        @Override
+        public boolean onMicRequested(boolean start) {
+            return handleMicRequest(start);
+        }
+    };
 
     private final BroadcastReceiver usbReceiver = new BroadcastReceiver() {
         @Override
@@ -192,8 +232,7 @@ public final class CarlinkitActivity extends Activity
         surfaceView.setOnTouchListener(new View.OnTouchListener() {
             @Override
             public boolean onTouch(View v, MotionEvent event) {
-                CarlinkitSession sess = session();
-                return sess != null && sess.onTouch(event);
+                return handleTouch(event);
             }
         });
 
@@ -201,6 +240,8 @@ public final class CarlinkitActivity extends Activity
 
         // The service owns the USB connection and outlives this screen: without it the
         // head unit re-enumerates the dongle and the USB permission is asked again.
+        // startService comes first on purpose, so the service is not destroyed when this
+        // screen unbinds.
         Intent svc = new Intent(this, CarlinkitService.class);
         startService(svc);
         bindService(svc, this, BIND_AUTO_CREATE);
@@ -340,6 +381,14 @@ public final class CarlinkitActivity extends Activity
         logBoth("onDestroy");
         releaseSurface();
         if (serviceBound) {
+            // Unregister first: the service must not keep a callback into a dead process.
+            if (service != null) {
+                try {
+                    service.unregisterCallback();
+                } catch (RemoteException e) {
+                    CarlinkitFileLog.log(TAG, "unregisterCallback failed", e);
+                }
+            }
             try {
                 unbindService(this);
             } catch (Throwable ignored) {
@@ -361,6 +410,14 @@ public final class CarlinkitActivity extends Activity
 
     // ------------------------------------------------------------------ USB
 
+    /**
+     * Looks for the dongle and asks for USB permission if needed.
+     *
+     * The request stays here, in the UI process, because this head unit never delivers
+     * USB_DEVICE_ATTACHED for the dongle: the dialog is the only path to the grant. The
+     * grant then applies app-wide (both processes share the UID), so the service can open
+     * the device itself.
+     */
     private void findAndOpenDongle() {
         if (sessionStarted || usbManager == null) {
             return;
@@ -412,13 +469,13 @@ public final class CarlinkitActivity extends Activity
             pendingDevice = device;
             return;
         }
-        boolean reused = service.isStarted();
-        if (!service.ensureStarted(device, usbManager, this)) {
+        boolean reused = svcIsStarted();
+        if (!svcEnsureStarted(device)) {
             logBoth("could not start the session in the service");
             setStatus("failed to open the dongle");
             return;
         }
-        service.attachSurface(surfaceView);
+        svcAttachSurface();
         sessionStarted = true;
         applyCurrentNightMode();
         if (reused) {
@@ -427,10 +484,7 @@ public final class CarlinkitActivity extends Activity
         setStatus("waiting for phone...");
         logBoth("session started (" + surfaceView.getWidth() + "x" + surfaceView.getHeight()
                 + ") — log at " + CarlinkitFileLog.path());
-        CarlinkitSession sess = session();
-        if (sess != null) {
-            sess.onSurfaceReady();
-        }
+        svcOnSurfaceReady();
     }
 
     /**
@@ -440,20 +494,27 @@ public final class CarlinkitActivity extends Activity
      */
     private void releaseSurface() {
         sessionStarted = false;
-        if (service != null) {
-            service.detachSurface();
-        }
+        svcDetachSurface();
     }
 
     /**
      * Stops the session and the service, releasing the dongle.
      *
      * A BACK long press was tried as a shortcut and does not work: the head unit handles
-     * BACK and closes the app before the long press timeout. It is now triggered by a long
-     * press on the status.
+     * BACK and closes the app before the long press timeout. It is now triggered by a tap
+     * on the status.
      */
     private void stopServiceAndSession() {
         sessionStarted = false;
+        if (service != null) {
+            try {
+                service.shutdown();
+                return;
+            } catch (RemoteException e) {
+                CarlinkitFileLog.log(TAG, "shutdown failed", e);
+            }
+        }
+        // Not bound (or the service process is gone): fall back to the stop intent.
         Intent stop = new Intent(this, CarlinkitService.class);
         stop.setAction(CarlinkitService.ACTION_STOP);
         startService(stop);
@@ -463,19 +524,21 @@ public final class CarlinkitActivity extends Activity
 
     @Override
     public void onServiceConnected(ComponentName name, IBinder binder) {
-        service = ((CarlinkitService.CarlinkitBinder) binder).service();
+        service = ICarlinkitService.Stub.asInterface(binder);
         serviceBound = true;
-        logBoth("service connected (active session: " + service.isStarted() + ")");
-        service.setCallback(this);
-        if (service.isStarted()) {
+        boolean started = svcIsStarted();
+        logBoth("service connected (active session: " + started + ")");
+        try {
+            service.registerCallback(serviceCallback);
+        } catch (RemoteException e) {
+            CarlinkitFileLog.log(TAG, "registerCallback failed", e);
+        }
+        if (started) {
             // Back in the app: the USB connection is still alive, we only reattach the screen
-            service.attachSurface(surfaceView);
+            svcAttachSurface();
             sessionStarted = true;
             if (surfaceReady()) {
-                CarlinkitSession sess = service.session();
-                if (sess != null) {
-                    sess.onSurfaceReady();
-                }
+                svcOnSurfaceReady();
             }
             setStatus("reattaching the screen...");
         } else if (pendingDevice != null) {
@@ -512,41 +575,20 @@ public final class CarlinkitActivity extends Activity
             openDevice(d);
             return;
         }
-        CarlinkitSession sess = session();
-        if (sess != null) {
-            if (service != null) {
-                service.attachSurface(surfaceView);
-            }
+        if (svcIsStarted()) {
+            svcAttachSurface();
             // Recreates the decoder and reinjects SPS/PPS: the dongle sends the parameters only once
-            sess.onSurfaceReady();
+            svcOnSurfaceReady();
         }
     }
 
     @Override
     public void surfaceDestroyed(SurfaceHolder holder) {
         logBoth("surfaceDestroyed");
-        if (service != null) {
-            service.detachSurface();
-        }
+        svcDetachSurface();
     }
 
-    // ------------------------------------------------------- Session.Callback
-
-    @Override
-    public void onPhoneConnected(int phoneType) {
-        final String kind = phoneType == 5 ? "Android Auto"
-                : phoneType == 3 ? "CarPlay" : "type " + phoneType;
-        logBoth("phone connected: " + kind);
-        phoneConnected = true;
-        hideStatus();
-    }
-
-    @Override
-    public void onPhoneDisconnected() {
-        logBoth("phone disconnected");
-        phoneConnected = false;
-        setStatus("phone disconnected");
-    }
+    // ------------------------------------------------------------- Session
 
     /**
      * Reads the current day/night state from the head unit and applies it.
@@ -562,8 +604,7 @@ public final class CarlinkitActivity extends Activity
         try {
             Boolean night = HondaConnectManager.instance().isNight();
             if (night != null) {
-                CarlinkitSession sess = session();
-                boolean sent = sess != null && sess.setNightMode(night.booleanValue());
+                boolean sent = svcSetNightMode(night.booleanValue());
                 logBoth("current headlight state: " + (night.booleanValue() ? "night" : "day")
                         + (sent ? " -> applied" : " (will be applied on connect)"));
             }
@@ -576,9 +617,11 @@ public final class CarlinkitActivity extends Activity
      * The phone asked for the microphone. On the head unit the mic goes through the EcNc
      * service, which applies echo cancellation — without enabling it the capture comes in
      * empty or with echo from the speaker.
+     *
+     * Called from the service through {@link ICarlinkitCallback}: the head unit services are
+     * bound in this process, so only the UI can do it.
      */
-    @Override
-    public boolean onMicRequested(boolean start) {
+    boolean handleMicRequest(boolean start) {
         if (!hondaEnabled()) {
             logBoth("microphone: Honda integration disabled, using the mic directly");
             return false;
@@ -598,10 +641,42 @@ public final class CarlinkitActivity extends Activity
         }
     }
 
-    @Override
-    public void onStatus(String status) {
-        logBoth("state: " + status);
-        setStatus(status);
+    /**
+     * Converts the MotionEvent into the normalised coordinates the protocol expects and
+     * sends it to the service. The conversion happens here because this is where the
+     * MotionEvent and the real Surface size live; sending the event itself across the
+     * Binder would be wasteful.
+     */
+    private boolean handleTouch(MotionEvent event) {
+        int action;
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                action = CarlinkitProtocol.TouchAction.DOWN;
+                break;
+            case MotionEvent.ACTION_MOVE:
+                action = CarlinkitProtocol.TouchAction.MOVE;
+                break;
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_CANCEL:
+                action = CarlinkitProtocol.TouchAction.UP;
+                break;
+            default:
+                return false;
+        }
+        if (service == null || surfaceView == null) {
+            return false;
+        }
+        int w = surfaceView.getWidth();
+        int h = surfaceView.getHeight();
+        if (w <= 0 || h <= 0) {
+            return false;
+        }
+        try {
+            return service.sendTouch(action, event.getX() / w, event.getY() / h);
+        } catch (RemoteException e) {
+            CarlinkitFileLog.log(TAG, "sendTouch failed", e);
+            return false;
+        }
     }
 
     // ------------------------------------------------- HondaConnectManager
@@ -612,18 +687,16 @@ public final class CarlinkitActivity extends Activity
      */
     @Override
     public void onSteeringWheelKey(int keyType) {
-        CarlinkitSession sess = session();
-        boolean sent = sess != null && sess.onSteeringWheelKey(keyType);
+        boolean sent = svcSendSteeringKey(keyType);
         CarlinkitFileLog.log(TAG, "steering wheel keyType=" + keyType
-                + (sess == null ? " (session inactive)" : sent ? " sent" : " unmapped"));
+                + (service == null ? " (session inactive)" : sent ? " sent" : " unmapped"));
     }
 
     @Override
     public void onDayNightUpdate(boolean isNight) {
         // The dongle protocol has its own day/night commands; previously this was only
         // written to the log, which is why the screen did not darken.
-        CarlinkitSession sess = session();
-        boolean sent = sess != null && sess.setNightMode(isNight);
+        boolean sent = svcSetNightMode(isNight);
         CarlinkitFileLog.log(TAG, "night mode: " + isNight
                 + (sent ? " -> sent to the dongle" : " (session inactive)"));
     }
@@ -665,13 +738,13 @@ public final class CarlinkitActivity extends Activity
                 }
             } else if (code == keyCode(KeymapFragment.KeyMap.RIGHT)
                     || code == KeyEvent.KEYCODE_MEDIA_NEXT) {
-                if (sendToDongle(CarlinkitProtocol.Command.NEXT)) {
+                if (svcSendCommand(CarlinkitProtocol.Command.NEXT)) {
                     CarlinkitFileLog.log(TAG, "  -> next track");
                     return true;
                 }
             } else if (code == keyCode(KeymapFragment.KeyMap.LEFT)
                     || code == KeyEvent.KEYCODE_MEDIA_PREVIOUS) {
-                if (sendToDongle(CarlinkitProtocol.Command.PREV)) {
+                if (svcSendCommand(CarlinkitProtocol.Command.PREV)) {
                     CarlinkitFileLog.log(TAG, "  -> previous track");
                     return true;
                 }
@@ -696,6 +769,116 @@ public final class CarlinkitActivity extends Activity
             return k != 0 ? k : key.defaultValue();
         } catch (Throwable t) {
             return key.defaultValue();
+        }
+    }
+
+    // --------------------------------------------------------- service calls
+
+    /**
+     * Every method below wraps one AIDL call. RemoteException means the {@code :usb}
+     * process died; there is nothing to do about it here beyond logging and reporting
+     * failure, so the call sites stay free of try/catch.
+     */
+
+    private boolean svcIsStarted() {
+        if (service == null) {
+            return false;
+        }
+        try {
+            return service.isStarted();
+        } catch (RemoteException e) {
+            CarlinkitFileLog.log(TAG, "isStarted failed", e);
+            return false;
+        }
+    }
+
+    private boolean svcEnsureStarted(UsbDevice device) {
+        if (service == null) {
+            return false;
+        }
+        try {
+            return service.ensureStarted(device);
+        } catch (RemoteException e) {
+            CarlinkitFileLog.log(TAG, "ensureStarted failed", e);
+            return false;
+        }
+    }
+
+    /**
+     * Hands the current Surface, with its real size, to the service. The Surface is
+     * Parcelable, so the service in the other process can draw straight into it.
+     */
+    private void svcAttachSurface() {
+        if (service == null || surfaceView == null) {
+            return;
+        }
+        Surface surface = surfaceView.getHolder().getSurface();
+        if (surface == null || !surface.isValid()) {
+            CarlinkitFileLog.log(TAG, "attachSurface skipped — Surface not valid yet");
+            return;
+        }
+        try {
+            service.attachSurface(surface, surfaceView.getWidth(), surfaceView.getHeight());
+        } catch (RemoteException e) {
+            CarlinkitFileLog.log(TAG, "attachSurface failed", e);
+        }
+    }
+
+    private void svcDetachSurface() {
+        if (service == null) {
+            return;
+        }
+        try {
+            service.detachSurface();
+        } catch (RemoteException e) {
+            CarlinkitFileLog.log(TAG, "detachSurface failed", e);
+        }
+    }
+
+    private void svcOnSurfaceReady() {
+        if (service == null) {
+            return;
+        }
+        try {
+            service.onSurfaceReady();
+        } catch (RemoteException e) {
+            CarlinkitFileLog.log(TAG, "onSurfaceReady failed", e);
+        }
+    }
+
+    private boolean svcSendCommand(int command) {
+        if (service == null) {
+            return false;
+        }
+        try {
+            return service.sendCommand(command);
+        } catch (RemoteException e) {
+            CarlinkitFileLog.log(TAG, "sendCommand failed", e);
+            return false;
+        }
+    }
+
+    private boolean svcSendSteeringKey(int hondaKeyType) {
+        if (service == null) {
+            return false;
+        }
+        try {
+            return service.sendSteeringWheelKey(hondaKeyType);
+        } catch (RemoteException e) {
+            CarlinkitFileLog.log(TAG, "sendSteeringWheelKey failed", e);
+            return false;
+        }
+    }
+
+    private boolean svcSetNightMode(boolean night) {
+        if (service == null) {
+            return false;
+        }
+        try {
+            return service.setNightMode(night);
+        } catch (RemoteException e) {
+            CarlinkitFileLog.log(TAG, "setNightMode failed", e);
+            return false;
         }
     }
 
@@ -760,15 +943,6 @@ public final class CarlinkitActivity extends Activity
                 }
             }
         });
-    }
-
-    private CarlinkitSession session() {
-        return service != null ? service.session() : null;
-    }
-
-    private boolean sendToDongle(int command) {
-        CarlinkitSession sess = session();
-        return sess != null && sess.sendCommand(command);
     }
 
     private boolean surfaceReady() {

@@ -5,6 +5,7 @@ import android.os.Environment;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.PrintWriter;
@@ -32,15 +33,35 @@ import java.util.Locale;
  *
  * If a better target shows up later (a flash drive plugged in with the app already open),
  * {@link #reevaluateTarget(Context)} moves the writing there.
+ *
+ * <p><b>One file per process.</b> Since CarlinkitService runs in its own ":usb" process, this
+ * class is initialised twice and each instance writes its own file:
+ * {@code carlinkit-<timestamp>.log} in the UI process and
+ * {@code carlinkit-<timestamp>-usb.log} in ":usb". They must not share a file: each process
+ * has its own PrintWriter and its own buffer, so {@code synchronized} here means nothing
+ * across the process boundary and the lines would interleave mid-write. See
+ * {@link #processName()} for how the process is detected.
  */
 public final class CarlinkitFileLog {
 
     private static final String DIR_NAME = "carlinkit";
+    private static final String FILE_PREFIX = "carlinkit-";
+    private static final String FILE_EXT = ".log";
+    /** Suffix appended to the file name in the ":usb" service process. */
+    private static final String USB_SUFFIX = "-usb";
+    /** Process name suffix declared by {@code android:process=":usb"} in the manifest. */
+    private static final String USB_PROCESS = ":usb";
     private static final int MAX_SIZE_BYTES = 512 * 1024;
     /** Keep at most this many log files; older ones are deleted on startup. */
     private static final int MAX_FILES = 15;
     /** Hard cap for the whole log directory. */
     private static final long MAX_DIR_BYTES = 4L * 1024 * 1024;
+    /**
+     * Pruning never touches a file younger than this. Both processes prune the same
+     * directory at roughly the same time, and without this guard one of them could delete
+     * the log the other has just opened and is still writing to.
+     */
+    private static final long MIN_AGE_MS = 60 * 1000L;
 
     /** Hints that a mount point is removable USB storage. */
     private static final String[] USB_HINTS = {
@@ -48,6 +69,9 @@ public final class CarlinkitFileLog {
     };
 
     private static CarlinkitFileLog instance;
+
+    /** Cached process name; it cannot change while the process lives. */
+    private static volatile String processName;
 
     private final SimpleDateFormat timeFormat =
             new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
@@ -64,15 +88,19 @@ public final class CarlinkitFileLog {
                 // A new file is created on every app start, so old ones must be pruned or
                 // they accumulate forever on the head unit's small data partition.
                 pruneOldLogs(dir);
-                file = new File(dir, "carlinkit-"
+                file = new File(dir, FILE_PREFIX
                         + new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date())
-                        + ".log");
+                        // Per-process suffix: the UI and the ":usb" service both log, and a
+                        // single file written by two processes interleaves and truncates.
+                        + fileSuffix()
+                        + FILE_EXT);
                 writer = new PrintWriter(new FileWriter(file, true));
             }
         } catch (Throwable t) {
             writer = null;
         }
         writeLine("=== log started ===");
+        writeLine("process: " + processName() + (isUsbProcess() ? " [USB service]" : " [UI]"));
         writeLine("device: " + android.os.Build.MANUFACTURER + " " + android.os.Build.MODEL
                 + " | Android " + android.os.Build.VERSION.RELEASE
                 + " (API " + android.os.Build.VERSION.SDK_INT + ")");
@@ -195,23 +223,30 @@ public final class CarlinkitFileLog {
     /**
      * Deletes the oldest log files, keeping the directory bounded by both file count and
      * total size. Runs before a new log is created.
+     *
+     * <p>Both name patterns are pruned together ({@code carlinkit-<ts>.log} from the UI and
+     * {@code carlinkit-<ts>-usb.log} from the ":usb" service): the limits protect the
+     * partition, so they must apply to the sum of the two, not to each pattern separately.
      */
     private void pruneOldLogs(File dir) {
         try {
             File[] logs = dir.listFiles(new java.io.FilenameFilter() {
                 @Override
                 public boolean accept(File d, String name) {
-                    return name.startsWith("carlinkit-") && name.endsWith(".log");
+                    return isLogFileName(name);
                 }
             });
             if (logs == null || logs.length == 0) {
                 return;
             }
-            // Oldest first: the name carries a sortable timestamp (yyyyMMdd-HHmmss)
+            // Oldest first, by the timestamp embedded in the name (yyyyMMdd-HHmmss, which is
+            // sortable as text). Comparing whole names would be wrong now that two suffixes
+            // exist: "...-164509-usb.log" must not be ordered after "...-170000.log".
             java.util.Arrays.sort(logs, new java.util.Comparator<File>() {
                 @Override
                 public int compare(File a, File b) {
-                    return a.getName().compareTo(b.getName());
+                    int c = timestampOf(a.getName()).compareTo(timestampOf(b.getName()));
+                    return c != 0 ? c : a.getName().compareTo(b.getName());
                 }
             });
             long total = 0;
@@ -219,9 +254,14 @@ public final class CarlinkitFileLog {
                 total += f.length();
             }
             int removed = 0;
+            long now = System.currentTimeMillis();
             // Leave room for the file about to be created
             for (int i = 0; i < logs.length
                     && (logs.length - removed >= MAX_FILES || total > MAX_DIR_BYTES); i++) {
+                // The other process may have just opened its own log; do not delete it
+                if (now - logs[i].lastModified() < MIN_AGE_MS) {
+                    continue;
+                }
                 long len = logs[i].length();
                 if (logs[i].delete()) {
                     total -= len;
@@ -234,6 +274,20 @@ public final class CarlinkitFileLog {
         } catch (Throwable ignored) {
             // Housekeeping must never break logging
         }
+    }
+
+    /** Matches both {@code carlinkit-<ts>.log} and {@code carlinkit-<ts>-usb.log}. */
+    private static boolean isLogFileName(String name) {
+        return name != null && name.startsWith(FILE_PREFIX) && name.endsWith(FILE_EXT);
+    }
+
+    /** The {@code yyyyMMdd-HHmmss} part of a log file name, or the whole name if absent. */
+    private static String timestampOf(String name) {
+        String s = name.substring(FILE_PREFIX.length(), name.length() - FILE_EXT.length());
+        if (s.endsWith(USB_SUFFIX)) {
+            s = s.substring(0, s.length() - USB_SUFFIX.length());
+        }
+        return s;
     }
 
     /** @return list of {device, mountPoint, fsType} */
@@ -283,6 +337,73 @@ public final class CarlinkitFileLog {
         return t.contains("vfat") || t.contains("fat") || t.contains("exfat")
                 || t.contains("ntfs") || t.contains("ext") || t.contains("fuse")
                 || t.contains("sdcardfs");
+    }
+
+    // ------------------------------------------------------- process detection
+
+    /**
+     * Name of the process this code is running in, e.g. {@code it.smg.hu.carlinkit} for the
+     * UI and {@code it.smg.hu.carlinkit:usb} for {@link CarlinkitService}.
+     *
+     * <p>Read from {@code /proc/self/cmdline}. That file exists on every Android version
+     * (this app targets API 15) and is always readable by the process itself, while
+     * {@code ActivityManager.getRunningAppProcesses()} needs a Context, allocates, and on
+     * these old head unit ROMs returns a stale or incomplete list — including, sometimes, no
+     * entry at all for the process that is asking.
+     *
+     * <p>Lives here, and not in ODAApplication, because this class needs it before any
+     * Context work is done and ODAApplication would otherwise duplicate the parsing.
+     *
+     * @return the process name, or {@code ""} if it could not be read (treated as the main
+     *         process, which is the pre-existing behaviour)
+     */
+    public static String processName() {
+        String cached = processName;
+        if (cached == null) {
+            cached = readProcessName();
+            processName = cached;
+        }
+        return cached;
+    }
+
+    /** True in the service process declared as {@code android:process=":usb"}. */
+    public static boolean isUsbProcess() {
+        return processName().endsWith(USB_PROCESS);
+    }
+
+    /** Per-process log file name suffix: empty for the UI, {@code -usb} for the service. */
+    private static String fileSuffix() {
+        return isUsbProcess() ? USB_SUFFIX : "";
+    }
+
+    private static String readProcessName() {
+        FileInputStream in = null;
+        try {
+            in = new FileInputStream("/proc/self/cmdline");
+            byte[] buf = new byte[256];
+            int n = in.read(buf);
+            if (n > 0) {
+                // cmdline is a NUL-separated argv, NUL-padded: argv[0] is the process name
+                int end = 0;
+                while (end < n && buf[end] != 0) {
+                    end++;
+                }
+                String s = new String(buf, 0, end).trim();
+                if (s.length() > 0) {
+                    return s;
+                }
+            }
+        } catch (Throwable ignored) {
+            // Never fail because of this: "" means "assume the main process"
+        } finally {
+            if (in != null) {
+                try {
+                    in.close();
+                } catch (Throwable ignored) {
+                }
+            }
+        }
+        return "";
     }
 
     // ------------------------------------------------------------------ API
