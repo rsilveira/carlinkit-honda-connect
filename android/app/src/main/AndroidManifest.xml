@@ -84,32 +84,14 @@
             </intent-filter>
         </activity>
 
-        <!-- Owner of the USB connection, in its OWN process (":usb").
-
-             The separate process is the whole point: when the driver leaves the app the head
-             unit kills the UI process (it wants the RAM back for radio/navigation). If the
-             service lived in that same process it would die with it, the UsbDeviceConnection
-             would be closed, and the head unit would re-enumerate the dongle. Every
-             re-enumeration invalidates the USB permission grant, so coming back to the app
-             popped the "Allow the app to access the USB device?" dialog again — untouchable
-             on a head unit with no reliable touch on system dialogs.
-
-             In ":usb" the process keeps running (foreground service) with the connection
-             open, the dongle is never re-enumerated, the permission stays valid and the
-             dialog never reappears. The UI process may be killed and restarted freely: it
-             just re-binds to this service.
-
-             Consequence to keep in mind: ODAApplication.onCreate runs once per process, so it
-             must NOT initialise the Honda integration here (see ODAApplication). -->
+        <!-- Owner of the USB connection: it survives the screen being closed so the dongle
+             is not re-enumerated (which would require USB permission again on every
+             return). -->
         <service android:name=".carlinkit.CarlinkitService"
-            android:exported="false"
-            android:process=":usb" />
+            android:exported="false" />
 
         <!-- Lets Android offer "use by default for this device" and grant persistent USB
-             permission. The receiver does not open the Activity on purpose.
-             Stays in the default process: it only forwards an intent to the service, so
-             putting it in ":usb" would buy nothing and would start that process even when
-             the dongle is not the device that was attached. -->
+             permission. The receiver does not open the Activity on purpose. -->
         <receiver android:name=".carlinkit.CarlinkitUsbReceiver" android:exported="true">
             <intent-filter>
                 <action android:name="android.hardware.usb.action.USB_DEVICE_ATTACHED" />
