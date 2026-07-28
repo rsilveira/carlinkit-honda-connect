@@ -81,11 +81,16 @@ public final class CarlinkitFileLog {
         if (prunedCount > 0) {
             writeLine("pruned " + prunedCount + " old log file(s)");
         }
-        writeLine("--- storage diagnostics ---");
-        for (String line : diag) {
-            writeLine("  " + line);
+        // The full mount diagnostics only matter when the preferred target was not used:
+        // it accounted for a third of the log volume and its job (finding out that the USB
+        // stick mounts at /mnt/sdcard/usbdrive2) is done.
+        if (!"USB flash drive".equals(targetKind)) {
+            writeLine("--- storage diagnostics (unexpected target) ---");
+            for (String line : diag) {
+                writeLine("  " + line);
+            }
+            writeLine("--- end of diagnostics ---");
         }
-        writeLine("--- end of diagnostics ---");
     }
 
     /**

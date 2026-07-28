@@ -60,6 +60,16 @@ public final class CarlinkitActivity extends Activity
     private volatile boolean userLeft;
     /** Dongle detected before the Surface existed; opened once the Surface is ready. */
     private UsbDevice pendingDevice;
+    /**
+     * The dongle re-enumerates when the process dies (its ~9s watchdog reboots it), so right
+     * after opening the app it may briefly not be in the device list. Observed in the car:
+     * absent on one launch, present 11s later with a new device number. Retrying spares the
+     * user from closing and reopening the app.
+     */
+    private boolean wheelDiagLogged;
+    private int dongleSearchAttempts;
+    private static final int MAX_DONGLE_SEARCH_ATTEMPTS = 10;
+    private static final int DONGLE_SEARCH_INTERVAL_MS = 2000;
     /** True between requestPermission and the answer: the system dialog steals the focus
      *  and must not be mistaken for the user leaving the app. */
     private volatile boolean awaitingUsbPermission;
@@ -220,6 +230,7 @@ public final class CarlinkitActivity extends Activity
         super.onResume();
         // Fresh foreground: allow asking for USB permission again from scratch
         usbPermissionAttempts = 0;
+        dongleSearchAttempts = 0;
         // The app is in the foreground: any previous exit (including going to the
         // Settings) no longer applies.
         if (userLeft) {
@@ -239,14 +250,18 @@ public final class CarlinkitActivity extends Activity
                 // The steering wheel callback is registered at a configurable proprietary
                 // index. If it is wrong, no event arrives — logging it helps to compare
                 // with the value that works in OpenDroidAuto.
-                logBoth("wheelServiceBound=" + HondaConnectManager.instance().isWheelServiceBound()
-                        + " hasAudioFocus=" + HondaConnectManager.instance().hasAudioFocus());
-                logBoth("steeringWheelIdx=" + Settings.instance().advanced.steeringWheelIdx()
-                        + " modeMgrAudioIdx=" + Settings.instance().advanced.modeMgrAudioIdx()
-                        + " | keymap PLUS=" + keyCode(KeymapFragment.KeyMap.PLUS)
-                        + " MINUS=" + keyCode(KeymapFragment.KeyMap.MINUS)
-                        + " LEFT=" + keyCode(KeymapFragment.KeyMap.LEFT)
-                        + " RIGHT=" + keyCode(KeymapFragment.KeyMap.RIGHT));
+                if (!wheelDiagLogged) {
+                    wheelDiagLogged = true;
+                    // Once per app start: these values never change while running
+                    logBoth("wheelServiceBound=" + HondaConnectManager.instance().isWheelServiceBound()
+                            + " hasAudioFocus=" + HondaConnectManager.instance().hasAudioFocus()
+                            + " steeringWheelIdx=" + Settings.instance().advanced.steeringWheelIdx()
+                            + " modeMgrAudioIdx=" + Settings.instance().advanced.modeMgrAudioIdx()
+                            + " | keymap PLUS=" + keyCode(KeymapFragment.KeyMap.PLUS)
+                            + " MINUS=" + keyCode(KeymapFragment.KeyMap.MINUS)
+                            + " LEFT=" + keyCode(KeymapFragment.KeyMap.LEFT)
+                            + " RIGHT=" + keyCode(KeymapFragment.KeyMap.RIGHT));
+                }
             } catch (Throwable t) {
                 logBoth("Honda integration unavailable", t);
             }
@@ -317,9 +332,10 @@ public final class CarlinkitActivity extends Activity
         if (hasFocus && hondaEnabled()) {
             try {
                 HondaConnectManager.instance().initAudioBinding();
-                CarlinkitFileLog.log(TAG, "focus regained — steering wheel registration re-asserted"
-                        + " (wheelBound=" + HondaConnectManager.instance().isWheelServiceBound()
-                        + " audioFocus=" + HondaConnectManager.instance().hasAudioFocus() + ")");
+                // Silent on success: this runs on every focus change and added nothing
+                if (!HondaConnectManager.instance().isWheelServiceBound()) {
+                    CarlinkitFileLog.log(TAG, "focus regained but the wheel service is NOT bound");
+                }
             } catch (Throwable t) {
                 CarlinkitFileLog.log(TAG, "failed to re-assert the steering wheel registration", t);
             }
@@ -374,6 +390,7 @@ public final class CarlinkitActivity extends Activity
         HashMap<String, UsbDevice> devices = usbManager.getDeviceList();
         for (UsbDevice d : devices.values()) {
             if (CarlinkitProtocol.isSupportedDevice(d.getVendorId(), d.getProductId())) {
+                dongleSearchAttempts = 0;
                 logBoth("dongle found: " + d.getDeviceName()
                         + " (" + d.getVendorId() + ":" + d.getProductId() + ")");
                 if (usbManager.hasPermission(d)) {
@@ -389,8 +406,26 @@ public final class CarlinkitActivity extends Activity
                 return;
             }
         }
-        logBoth("no Carlinkit dongle found (looking for 1314:1520/1521)");
-        setStatus("dongle not found");
+        if (dongleSearchAttempts < MAX_DONGLE_SEARCH_ATTEMPTS) {
+            dongleSearchAttempts++;
+            // Do not report failure yet: the dongle is probably still re-enumerating
+            logBoth("dongle not in the device list — retry " + dongleSearchAttempts
+                    + "/" + MAX_DONGLE_SEARCH_ATTEMPTS + " in "
+                    + (DONGLE_SEARCH_INTERVAL_MS / 1000) + "s");
+            setStatus("looking for the dongle... (" + dongleSearchAttempts + ")");
+            surfaceView.postDelayed(new Runnable() {
+                @Override
+                public void run() {
+                    if (!sessionStarted && !userLeft) {
+                        findAndOpenDongle();
+                    }
+                }
+            }, DONGLE_SEARCH_INTERVAL_MS);
+            return;
+        }
+        logBoth("no Carlinkit dongle found after " + dongleSearchAttempts
+                + " attempts (looking for 1314:1520/1521)");
+        setStatus("Dongle not found.\nCheck the USB connection.");
     }
 
     private void openDevice(UsbDevice device) {
@@ -639,7 +674,8 @@ public final class CarlinkitActivity extends Activity
         int code = event.getKeyCode();
         int action = event.getAction();
         if (action == KeyEvent.ACTION_DOWN) {
-            CarlinkitFileLog.log(TAG, "KeyEvent DOWN keyCode=" + code);
+            // Raw key logging is only useful while mapping a new head unit; the mapped
+            // results below are what matter day to day.
 
             if (code == keyCode(KeymapFragment.KeyMap.PLUS)
                     || code == KeyEvent.KEYCODE_VOLUME_UP) {
