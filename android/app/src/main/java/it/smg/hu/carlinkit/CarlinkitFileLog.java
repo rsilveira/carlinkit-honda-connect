@@ -36,7 +36,11 @@ import java.util.Locale;
 public final class CarlinkitFileLog {
 
     private static final String DIR_NAME = "carlinkit";
-    private static final int MAX_SIZE_BYTES = 2 * 1024 * 1024;
+    private static final int MAX_SIZE_BYTES = 512 * 1024;
+    /** Keep at most this many log files; older ones are deleted on startup. */
+    private static final int MAX_FILES = 15;
+    /** Hard cap for the whole log directory. */
+    private static final long MAX_DIR_BYTES = 4L * 1024 * 1024;
 
     /** Hints that a mount point is removable USB storage. */
     private static final String[] USB_HINTS = {
@@ -50,12 +54,16 @@ public final class CarlinkitFileLog {
     private PrintWriter writer;
     private File file;
     private String targetKind = "?";
+    private int prunedCount;
 
     private CarlinkitFileLog(Context ctx) {
         List<String> diag = new ArrayList<String>();
         File dir = chooseTarget(ctx, diag);
         try {
             if (dir != null) {
+                // A new file is created on every app start, so old ones must be pruned or
+                // they accumulate forever on the head unit's small data partition.
+                pruneOldLogs(dir);
                 file = new File(dir, "carlinkit-"
                         + new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date())
                         + ".log");
@@ -70,6 +78,9 @@ public final class CarlinkitFileLog {
                 + " (API " + android.os.Build.VERSION.SDK_INT + ")");
         writeLine("log written to: " + (file != null ? file.getAbsolutePath() : "NONE")
                 + " (" + targetKind + ")");
+        if (prunedCount > 0) {
+            writeLine("pruned " + prunedCount + " old log file(s)");
+        }
         writeLine("--- storage diagnostics ---");
         for (String line : diag) {
             writeLine("  " + line);
@@ -179,6 +190,50 @@ public final class CarlinkitFileLog {
         }
         targetKind = "no writable target";
         return null;
+    }
+
+    /**
+     * Deletes the oldest log files, keeping the directory bounded by both file count and
+     * total size. Runs before a new log is created.
+     */
+    private void pruneOldLogs(File dir) {
+        try {
+            File[] logs = dir.listFiles(new java.io.FilenameFilter() {
+                @Override
+                public boolean accept(File d, String name) {
+                    return name.startsWith("carlinkit-") && name.endsWith(".log");
+                }
+            });
+            if (logs == null || logs.length == 0) {
+                return;
+            }
+            // Oldest first: the name carries a sortable timestamp (yyyyMMdd-HHmmss)
+            java.util.Arrays.sort(logs, new java.util.Comparator<File>() {
+                @Override
+                public int compare(File a, File b) {
+                    return a.getName().compareTo(b.getName());
+                }
+            });
+            long total = 0;
+            for (File f : logs) {
+                total += f.length();
+            }
+            int removed = 0;
+            // Leave room for the file about to be created
+            for (int i = 0; i < logs.length
+                    && (logs.length - removed >= MAX_FILES || total > MAX_DIR_BYTES); i++) {
+                long len = logs[i].length();
+                if (logs[i].delete()) {
+                    total -= len;
+                    removed++;
+                }
+            }
+            if (removed > 0) {
+                prunedCount = removed;
+            }
+        } catch (Throwable ignored) {
+            // Housekeeping must never break logging
+        }
     }
 
     /** @return list of {device, mountPoint, fsType} */
@@ -303,7 +358,7 @@ public final class CarlinkitFileLog {
             writer.println(timeFormat.format(new Date()) + " " + line);
             writer.flush();   // the app can be killed without warning
             if (file != null && file.length() > MAX_SIZE_BYTES) {
-                writer.println("=== size limit reached ===");
+                writer.println("=== size limit reached (" + MAX_SIZE_BYTES / 1024 + " KB) ===");
                 writer.flush();
                 writer.close();
                 writer = null;
