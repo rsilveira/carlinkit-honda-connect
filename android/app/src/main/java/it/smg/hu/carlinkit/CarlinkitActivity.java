@@ -70,6 +70,15 @@ public final class CarlinkitActivity extends Activity
     private int dongleSearchAttempts;
     private static final int MAX_DONGLE_SEARCH_ATTEMPTS = 10;
     private static final int DONGLE_SEARCH_INTERVAL_MS = 2000;
+    /**
+     * Wait before searching again after the dongle drops.
+     *
+     * The stale device instance lingers in the USB device list for a moment after the
+     * detach. Searching immediately finds that dead instance and reopens it, which is
+     * exactly what happened on 28/Jul: the session dropped 156ms and 74ms after starting.
+     * Waiting lets the list settle so the retry loop picks up the new instance.
+     */
+    private static final int DONGLE_RECONNECT_DELAY_MS = 4000;
     /** True between requestPermission and the answer: the system dialog steals the focus
      *  and must not be mistaken for the user leaving the app. */
     private volatile boolean awaitingUsbPermission;
@@ -116,6 +125,7 @@ public final class CarlinkitActivity extends Activity
                     logBoth("dongle disconnected");
                     releaseSurface();
                     setStatus("dongle disconnected");
+                    scheduleDongleReconnect();
                 }
             } else if (UsbManager.ACTION_USB_DEVICE_ATTACHED.equals(action)) {
                 // It may be the dongle or a flash drive: if it is a flash drive, the log moves to it
@@ -377,6 +387,39 @@ public final class CarlinkitActivity extends Activity
 
     // ------------------------------------------------------------------ USB
 
+    /**
+     * Reconnects by itself after the dongle drops, with no user action.
+     *
+     * The dongle restarts on its own roughly 9s after its heartbeat stops, which is what
+     * happens whenever the app is closed. Reopening the app before that cycle finishes
+     * grabs a device instance that is already dying: on 28/Jul the session died 156ms and
+     * 74ms after "session started in the service", and the user had to leave and reopen
+     * several times until the timing happened to line up.
+     *
+     * Waiting first, and only then reusing the regular search loop, lets the dead instance
+     * leave the USB device list so the new one is picked up instead.
+     */
+    private void scheduleDongleReconnect() {
+        if (userLeft) {
+            return;
+        }
+        // A dialog left open would block the search forever, since findAndOpenDongle()
+        // returns early while a permission request is pending.
+        awaitingUsbPermission = false;
+        dongleSearchAttempts = 0;
+        logBoth("dongle is restarting — searching again in "
+                + (DONGLE_RECONNECT_DELAY_MS / 1000) + "s");
+        setStatus("dongle restarting...\nreconnecting automatically");
+        surfaceView.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (!sessionStarted && !userLeft) {
+                    findAndOpenDongle();
+                }
+            }
+        }, DONGLE_RECONNECT_DELAY_MS);
+    }
+
     private void findAndOpenDongle() {
         if (sessionStarted || usbManager == null) {
             return;
@@ -391,8 +434,12 @@ public final class CarlinkitActivity extends Activity
         for (UsbDevice d : devices.values()) {
             if (CarlinkitProtocol.isSupportedDevice(d.getVendorId(), d.getProductId())) {
                 dongleSearchAttempts = 0;
+                // Hex, to match the "looking for 1314:1520/1521" message and the USB
+                // convention. It used to be printed in decimal (4884:5409), which looked
+                // like a different device and confused the log analysis.
                 logBoth("dongle found: " + d.getDeviceName()
-                        + " (" + d.getVendorId() + ":" + d.getProductId() + ")");
+                        + " (" + Integer.toHexString(d.getVendorId())
+                        + ":" + Integer.toHexString(d.getProductId()) + ")");
                 if (usbManager.hasPermission(d)) {
                     openDevice(d);
                 } else {
