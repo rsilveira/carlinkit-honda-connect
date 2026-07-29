@@ -171,21 +171,25 @@ export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 ```
 
 ### Screen resolution
-The physical resolution is not recorded anywhere in the head unit software (checked
-the decompiled sources — nothing). Indirect clues:
-`VIDEO_RESOLUTION_DEFAULT_VALUE = 1` (480p) and `VIDEO_DPI_DEFAULT_VALUE = 140`, consistent
-with ~800x480, which matches the physical screen → go with **800x480**.
-Better still: derive it from `SurfaceView.surfaceChanged()` at runtime, avoiding a hardcoded
-value.
+The physical resolution is not recorded anywhere in the head unit software. The indirect
+evidence points at ~800x480: `VIDEO_RESOLUTION_DEFAULT_VALUE = 1` (480p) and
+`VIDEO_DPI_DEFAULT_VALUE = 140`.
 
-### Next steps
-1. **Video**: wire `onVideoData` → `OMXVideoCodec.mediaDecode()`. Risk: `omxvideocodec` was
-   written for the Android Auto stream; there may be differences in SPS/PPS or in the 20 bytes
-   of `VIDEO_DATA` metadata that I currently discard.
-2. **Touch**: `MotionEvent` → `sendTouch()` (already implemented in the driver).
-3. **Audio**: PCM → `AudioTrack` (API 15 has it). Parse the format from the `AUDIO_DATA`
-   header.
-4. No adb on the head unit: the test cycle is manual sideloading. Log to a file for diagnosis
-   (the project already has `ODALog`).
+Rather than hardcoding it, the app derives the size from `SurfaceView.surfaceChanged()` at
+runtime and sends that to the dongle in the Open command. This turned out to matter: without
+`FLAG_FULLSCREEN` the status bar takes 63px and the Surface is 800x**417**, so a hardcoded
+800x480 makes the video overflow and the touch coordinates land in the wrong place.
+
+### Status
+Everything above is implemented and validated in the car. The README has the feature table,
+and `docs/` covers the head unit, video, audio and microphone in detail.
+
+Two constraints are worth repeating, because they shaped the design:
+
+- **`omxvideocodec` was written for the Android Auto stream.** It decodes the Carlinkit H.264
+  stream, but the 20 bytes of `VIDEO_DATA` metadata are discarded rather than parsed.
+- **There is no adb on the head unit.** The test cycle is manual sideloading from a USB stick,
+  which is why the app writes its own rotating file log — without it there is no way to see
+  what happened.
 
 ---
