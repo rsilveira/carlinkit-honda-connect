@@ -2,6 +2,16 @@ plugins {
     id 'com.android.application'
 }
 
+// Release signing credentials live OUTSIDE the repository. Without this file the release
+// build falls back to the debug key, which is fine for local use but must never be
+// published: debug builds are android:debuggable and cannot be upgraded to a release key
+// later (Android rejects an APK signed with a different key).
+def keystorePropsFile = rootProject.file("keystore.properties")
+def keystoreProps = new Properties()
+if (keystorePropsFile.exists()) {
+    keystoreProps.load(new FileInputStream(keystorePropsFile))
+}
+
 android {
     // Os fontes extraidos vivem em it.smg.hu e usam o R desse pacote.
     namespace 'it.smg.hu'
@@ -44,12 +54,27 @@ android {
         }
     }
 
+    signingConfigs {
+        release {
+            if (keystoreProps.containsKey("storeFile")) {
+                storeFile file(keystoreProps["storeFile"])
+                storePassword keystoreProps["storePassword"]
+                keyAlias keystoreProps["keyAlias"]
+                keyPassword keystoreProps["keyPassword"]
+            }
+        }
+    }
+
     buildTypes {
         debug {
         }
 
         release {
-            signingConfig debug.signingConfig
+            // Uses the project key when the credentials are available, otherwise the debug
+            // key so the build never breaks for someone who just cloned the repository.
+            signingConfig keystoreProps.containsKey("storeFile")
+                    ? signingConfigs.release
+                    : signingConfigs.debug
             // ProGuard fica DESLIGADO de proposito: o JNI usa GetDirectBufferAddress e as
             // interfaces AIDL da Fujitsu sao resolvidas por nome — ofuscar quebra ambos.
             minifyEnabled false

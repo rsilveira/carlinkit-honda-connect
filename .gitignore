@@ -34,3 +34,8 @@ android/*/.cxx/
 android/.gradle/
 android/local.properties
 *.apk
+
+# Release signing credentials — must never be committed
+android/keystore.properties
+*.jks
+*.keystore
