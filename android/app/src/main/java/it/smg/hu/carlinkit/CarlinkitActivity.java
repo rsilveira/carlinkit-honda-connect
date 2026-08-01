@@ -77,8 +77,34 @@ public final class CarlinkitActivity extends Activity
      * detach. Searching immediately finds that dead instance and reopens it, which is
      * exactly what happened on 28/Jul: the session dropped 156ms and 74ms after starting.
      * Waiting lets the list settle so the retry loop picks up the new instance.
+     *
+     * Raised from 4s to 8s after the 01/Aug test: with 4s the reconnection did find the
+     * new instance (device 112 -> 113 -> 114), but the dongle dropped again 8s later and
+     * ended up in a state where it enumerated and accepted a session while never sending
+     * any status. Reopening it while it is still rebooting appears to make that worse.
      */
-    private static final int DONGLE_RECONNECT_DELAY_MS = 4000;
+    private static final int DONGLE_RECONNECT_DELAY_MS = 8000;
+    /**
+     * Automatic reconnection is attempted only once.
+     *
+     * On the 01/Aug test three reconnections in 20s produced a cascade of USB permission
+     * dialogs and left the dongle unresponsive; only powering the car off and on brought
+     * it back (the device number jumped from 115 to 119). Retrying harder does not help
+     * when the dongle itself is the thing that needs a power cycle, so after one failed
+     * attempt the app says so instead of looping.
+     */
+    private int dongleReconnectAttempts;
+    private static final int MAX_DONGLE_RECONNECT_ATTEMPTS = 1;
+    /**
+     * How long to wait for the first status message before declaring the dongle mute.
+     *
+     * A healthy dongle reports its state about 1s after the session starts: measured
+     * 1.019s, 1.018s and 1.017s across three good sessions. When it is wedged the session
+     * starts normally and no status ever arrives — three consecutive launches sat silent
+     * for 99s, 15s and 33s with the user unaware that nothing would happen. 10s is an
+     * order of magnitude above the healthy case, so it does not fire on a slow start.
+     */
+    private static final int DONGLE_MUTE_TIMEOUT_MS = 10000;
     /** True between requestPermission and the answer: the system dialog steals the focus
      *  and must not be mistaken for the user leaving the app. */
     private volatile boolean awaitingUsbPermission;
@@ -105,8 +131,8 @@ public final class CarlinkitActivity extends Activity
                 } else if (usbPermissionAttempts < MAX_USB_PERMISSION_ATTEMPTS) {
                     // The dialog can dismiss itself here; ask again instead of leaving the
                     // app waiting for the user to reopen it.
-                    logBoth("permission denied on attempt " + usbPermissionAttempts
-                            + " — asking again");
+                    logBoth("permission denied — attempt " + usbPermissionAttempts
+                            + "/" + MAX_USB_PERMISSION_ATTEMPTS + ", asking again");
                     setStatus("USB permission denied — asking again");
                     surfaceView.postDelayed(new Runnable() {
                         @Override
@@ -238,9 +264,19 @@ public final class CarlinkitActivity extends Activity
     @Override
     protected void onResume() {
         super.onResume();
-        // Fresh foreground: allow asking for USB permission again from scratch
-        usbPermissionAttempts = 0;
-        dongleSearchAttempts = 0;
+        // Only a genuine return to the foreground resets the retry budget.
+        //
+        // The USB permission dialog takes the focus away and gives it back, so it runs
+        // onResume too — and it runs BEFORE the permission broadcast arrives. Resetting
+        // the counters here unconditionally meant every denial started over from zero:
+        // the 01/Aug log shows "permission denied on attempt 0" twice in a row, so
+        // MAX_USB_PERMISSION_ATTEMPTS was never reached and the app kept reopening the
+        // dialog. Keeping the counters while a request is pending makes the limit real.
+        if (!awaitingUsbPermission) {
+            usbPermissionAttempts = 0;
+            dongleSearchAttempts = 0;
+            dongleReconnectAttempts = 0;
+        }
         // The app is in the foreground: any previous exit (including going to the
         // Settings) no longer applies.
         if (userLeft) {
@@ -365,6 +401,10 @@ public final class CarlinkitActivity extends Activity
         super.onDestroy();
         logBoth("onDestroy");
         releaseSurface();
+        // Pending delayed work outlives the Activity and would run against a dead one.
+        if (surfaceView != null) {
+            surfaceView.removeCallbacks(muteDongleCheck);
+        }
         if (serviceBound) {
             try {
                 unbindService(this);
@@ -403,13 +443,25 @@ public final class CarlinkitActivity extends Activity
         if (userLeft) {
             return;
         }
+        if (dongleReconnectAttempts >= MAX_DONGLE_RECONNECT_ATTEMPTS) {
+            // Beyond this point the dongle needs a power cycle, not another open attempt.
+            logBoth("dongle dropped again after " + dongleReconnectAttempts
+                    + " reconnection — not retrying");
+            setStatus("The dongle keeps restarting.\n"
+                    + "Turn the car off and on again.");
+            return;
+        }
+        dongleReconnectAttempts++;
         // A dialog left open would block the search forever, since findAndOpenDongle()
         // returns early while a permission request is pending.
         awaitingUsbPermission = false;
         dongleSearchAttempts = 0;
         logBoth("dongle is restarting — searching again in "
+                + (DONGLE_RECONNECT_DELAY_MS / 1000) + "s"
+                + " (attempt " + dongleReconnectAttempts
+                + "/" + MAX_DONGLE_RECONNECT_ATTEMPTS + ")");
+        setStatus("dongle restarting...\nreconnecting in "
                 + (DONGLE_RECONNECT_DELAY_MS / 1000) + "s");
-        setStatus("dongle restarting...\nreconnecting automatically");
         surfaceView.postDelayed(new Runnable() {
             @Override
             public void run() {
@@ -419,6 +471,43 @@ public final class CarlinkitActivity extends Activity
             }
         }, DONGLE_RECONNECT_DELAY_MS);
     }
+
+    /**
+     * Warns when the dongle enumerates, accepts a session and then stays silent.
+     *
+     * This is the failure that cost the most time on 01/Aug: the app looked fine — "session
+     * started (800x480)" — and nothing ever happened, because the dongle was wedged. There
+     * is no error to detect, only the absence of traffic, so the check is a timeout.
+     *
+     * Liveness is taken from the session's own traffic, not from status messages: a session
+     * reopened while the phone is still connected receives no status at all and is perfectly
+     * healthy, so keying on status would warn on a working setup.
+     *
+     * Deliberately conservative: it only fires when nothing was ever received on this
+     * session. A dongle that wedges after having worked is not caught, because "no traffic
+     * for a while" is normal with a static screen and a false warning would be worse than
+     * a missed one. All three wedged launches on 01/Aug opened a fresh session, so this
+     * covers the case that was actually observed.
+     */
+    private final Runnable muteDongleCheck = new Runnable() {
+        @Override
+        public void run() {
+            if (!sessionStarted || userLeft) {
+                return;
+            }
+            CarlinkitSession sess = session();
+            if (sess != null && sess.hasReceivedData()) {
+                // Healthy session: the failure episode is over, so a later drop gets a
+                // fresh reconnection attempt.
+                dongleReconnectAttempts = 0;
+                return;
+            }
+            logBoth("dongle opened but sent nothing in "
+                    + (DONGLE_MUTE_TIMEOUT_MS / 1000) + "s — it is not responding");
+            setStatus("The dongle is not responding.\n"
+                    + "Turn the car off and on again.");
+        }
+    };
 
     private void findAndOpenDongle() {
         if (sessionStarted || usbManager == null) {
@@ -509,6 +598,9 @@ public final class CarlinkitActivity extends Activity
         setStatus("waiting for phone...");
         logBoth("session started (" + surfaceView.getWidth() + "x" + surfaceView.getHeight()
                 + ") — log at " + CarlinkitFileLog.path());
+        // Arm the mute-dongle check: a healthy dongle answers in about 1s.
+        surfaceView.removeCallbacks(muteDongleCheck);
+        surfaceView.postDelayed(muteDongleCheck, DONGLE_MUTE_TIMEOUT_MS);
         CarlinkitSession sess = session();
         if (sess != null) {
             sess.onSurfaceReady();
@@ -522,6 +614,9 @@ public final class CarlinkitActivity extends Activity
      */
     private void releaseSurface() {
         sessionStarted = false;
+        if (surfaceView != null) {
+            surfaceView.removeCallbacks(muteDongleCheck);
+        }
         if (service != null) {
             service.detachSurface();
         }

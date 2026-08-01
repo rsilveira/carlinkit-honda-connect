@@ -59,6 +59,17 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
 
     private CarlinkitDriver driver;
     private volatile boolean surfaceReady;
+    /**
+     * True once anything at all arrives from the dongle.
+     *
+     * The dongle can enumerate, accept the Open command and then stay completely silent —
+     * observed on 01/Aug across three consecutive launches, which looked identical to a
+     * healthy start from the outside. Status commands are not a reliable liveness signal:
+     * when the session is reopened while the phone is still connected the dongle sends no
+     * status at all, yet works fine (measured: a session with zero status messages that
+     * ran the voice assistant 35s later). Video and audio traffic is the honest signal.
+     */
+    private volatile boolean receivedData;
     /** Last day/night state reported by the head unit, applied once the session is ready. */
     private Boolean pendingNightMode;
 
@@ -88,6 +99,11 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
     /** Size negotiated with the dongle in the Open command; does not change afterwards. */
     public boolean isStarted() {
         return driver != null;
+    }
+
+    /** @return true if the dongle has sent anything since the session opened */
+    public boolean hasReceivedData() {
+        return receivedData;
     }
 
     public void setCallback(Callback cb) {
@@ -244,6 +260,7 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
 
     @Override
     public void onVideoFrame(VideoMessage msg, byte[] payload, boolean isParameterSet) {
+        receivedData = true;
         if (!surfaceReady) {
             return;   // with no Surface there is nowhere to draw; the cache keeps the SPS
         }
@@ -255,6 +272,7 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
 
     @Override
     public void onAudio(AudioMessage msg, byte[] payload) {
+        receivedData = true;
         audio.onAudio(msg, payload);
         if (msg != null && msg.kind == AudioMessage.KIND_COMMAND) {
             handleMicCommand(msg.command);
@@ -333,6 +351,7 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
 
     @Override
     public void onMessage(int type, byte[] payload) {
+        receivedData = true;
         if (Log.isVerbose()) {
             Log.v(TAG, "msg " + CarlinkitProtocol.typeName(type));
         }
