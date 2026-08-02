@@ -12,20 +12,30 @@ import it.smg.libs.common.Log;
 /**
  * Receives {@code USB_DEVICE_ATTACHED} and hands the dongle over to {@link CarlinkitService}.
  *
- * <p><b>Why this gets rid of the permission prompt.</b> When Android delivers the
- * {@code USB_DEVICE_ATTACHED} intent to an app that declares the matching
- * {@code device_filter}, that app receives <b>implicit permission</b> for the device — with no
- * dialog. By opening the connection here, as soon as the broadcast arrives, we take advantage
- * of that permission.
+ * <p><b>The intent was to avoid the permission prompt, and on this head unit it does not
+ * work.</b> When Android delivers {@code USB_DEVICE_ATTACHED} to an app that declares the
+ * matching {@code device_filter}, that app receives implicit permission for the device, with
+ * no dialog. That is the documented mechanism and the reason this receiver exists — but the
+ * broadcast never arrives here. Across 11 test sessions and 4274 log lines this receiver was
+ * invoked <b>zero times</b>, and the permission dialog appeared on essentially every launch.
+ * Something in the head unit firmware does not deliver the broadcast to apps.
  *
- * <p>The test logs showed why this was necessary: the dongle re-enumerates on its own
- * (devices 078, 079, 082, 083 within a few minutes) and every enumeration is a brand new
- * device, requiring authorization all over again. On top of that the head unit kills the app
- * process without calling {@code onDestroy}, so there is no way to keep state in the Activity
- * alone.
+ * <p>The receiver is kept because it is harmless, it is the correct mechanism on a standard
+ * Android device, and a firmware update could start delivering the broadcast. Do not assume
+ * the prompt is handled: the Activity still has to request permission explicitly, and that
+ * path is the one that runs in practice.
  *
- * <p>It starts the <b>Service</b>, never the Activity: that way the dongle is connected in the
- * background without interrupting the FM radio.
+ * <p><b>Do not move the filter to the Activity.</b> It was tried and reverted: leaving the app
+ * releases the dongle, the head unit re-enumerates it, and the intent relaunched the Activity —
+ * making it impossible to listen to the FM radio. See the note in {@code AndroidManifest.xml}.
+ *
+ * <p>The dongle re-enumerates constantly on its own (devices 078, 079, 082, 083 within a few
+ * minutes) and every enumeration is a brand new device, requiring authorization all over again.
+ * On top of that the head unit kills the app process without calling {@code onDestroy}, so
+ * there is no way to keep state in the Activity alone.
+ *
+ * <p>It starts the <b>Service</b>, never the Activity: that way the dongle would be connected
+ * in the background without interrupting the FM radio.
  */
 public final class CarlinkitUsbReceiver extends BroadcastReceiver {
 

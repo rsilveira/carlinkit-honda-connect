@@ -32,6 +32,28 @@ Working in the car, verified on the target head unit:
 
 Known limitations are listed in [docs/FINDINGS.md](docs/FINDINGS.md).
 
+## What to expect in daily use
+
+The features above work, but two behaviours are visible every time you use it. Neither is a
+defect in this app — both come from the dongle and the head unit — and knowing about them
+saves a lot of confusion.
+
+**A USB permission dialog appears on almost every launch.** The dongle re-enumerates on the
+USB bus constantly (its own watchdog reboots it roughly 9s after the host stops talking to
+it), and Android grants USB permission *per device instance*. A new instance means a new
+authorization. Measured across test sessions: 5 to 6 distinct device numbers in 7 to 11
+launches. Tick "use by default" and accept — the app cannot suppress the prompt.
+
+The standard way to avoid it is a `device_filter` plus a `USB_DEVICE_ATTACHED` intent filter,
+which grants implicit permission. That is implemented, and on this head unit it never fires:
+the broadcast was delivered zero times across 11 test sessions. Something in the firmware does
+not hand it to apps.
+
+**Occasionally the dongle needs a power cycle.** It can enumerate, accept a session and then
+send nothing at all — the screen says the session started and no phone ever connects.
+Reopening the app does not help, because the dongle itself is wedged. Turn the car off and on.
+The app detects this state after 10s and says so on screen, rather than leaving you guessing.
+
 ## Target hardware
 
 | | |
@@ -112,6 +134,19 @@ sudo ./venv/bin/python tools/session.py          # persistent session, records v
 ```
 
 `sudo` is required to claim the vendor-specific USB interface.
+
+`tools/bench_reconnect.py` answers two questions that car logs cannot, since each road test
+costs a drive:
+
+```bash
+# does reopening too soon cause the wedged state? compare the two
+sudo ./venv/bin/python tools/bench_reconnect.py reset --cycles 20 --delay 4
+sudo ./venv/bin/python tools/bench_reconnect.py reset --cycles 20 --delay 8
+
+# does the dongle send anything on its own? longest gap decides if a
+# sliding-window watchdog is safe
+sudo ./venv/bin/python tools/bench_reconnect.py idle --seconds 120
+```
 
 ## Documentation
 

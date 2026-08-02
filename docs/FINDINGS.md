@@ -1,7 +1,12 @@
-# Carlinkit on the 2016 HR-V EXL — initial exploration (Jul 27, 2026)
+# Carlinkit on the 2016 HR-V EXL — findings
 
 Goal: use the Carlinkit dongle on the HR-V's old Android head unit, since the official app does
 not support the head unit's Android version.
+
+The first part of this document is the initial exploration (Jul 27, 2026): reverse engineering
+the protocol on a PC and getting it to run on the head unit. The second part, *Dongle behaviour
+in real use*, covers what was learned once the app was used in the car — a different class of
+problem, and the one that took the most time.
 
 ## Confirmed hardware
 
@@ -191,5 +196,110 @@ Two constraints are worth repeating, because they shaped the design:
 - **There is no adb on the head unit.** The test cycle is manual sideloading from a USB stick,
   which is why the app writes its own rotating file log — without it there is no way to see
   what happened.
+
+---
+
+# Dongle behaviour in real use (Jul 28 – Aug 1, 2026)
+
+Everything above came from getting the protocol working. This section covers what was learned
+once the app ran in the car for real, which turned out to be a different set of problems: not
+"does the protocol work" but "what does the dongle do when nobody is watching". All numbers
+here are measured from the app's own file logs.
+
+## The dongle re-enumerates constantly
+
+Its watchdog reboots it roughly 9s after the host heartbeat stops, which happens whenever the
+app is closed. Every reboot is a new USB device instance. Device numbers observed within single
+test sessions:
+
+| Session | Launches | Distinct device numbers |
+|---|---|---|
+| Jul 28 (a) | 8 | 6 |
+| Jul 28 (b) | 7 | 5 |
+| Jul 29 | 7 | 5 |
+| Aug 1 | 11 | 6 |
+
+**Consequence: the USB permission dialog cannot be avoided.** Android grants USB permission per
+device instance, so a new instance needs a new authorization.
+
+The documented escape is a `device_filter` plus a `USB_DEVICE_ATTACHED` intent filter, which
+grants implicit permission with no dialog. It is implemented in `CarlinkitUsbReceiver` and
+**never fires on this head unit**: across 11 test sessions and 4274 log lines, the receiver was
+invoked zero times. The firmware does not deliver the broadcast to apps. The code is kept
+because it is correct on a standard device and costs nothing, but the Activity's explicit
+request is the path that actually runs.
+
+Do not move the filter to the Activity. It was tried and reverted: the app relaunched itself
+whenever the dongle re-enumerated, which made listening to the FM radio impossible.
+
+## Reopening too soon kills the session
+
+Leaving the app releases the dongle, which starts its reboot cycle. Reopening during that
+window grabs a device instance that is already dying.
+
+| Time between leaving and reopening | Result |
+|---|---|
+| 2s | session died 74ms after starting |
+| 5s | session died 156ms after starting |
+| 41s | worked normally |
+
+The app now waits before searching again after a drop, and reuses the retry loop so the dead
+instance has time to leave the device list.
+
+**How long re-enumeration actually takes is not settled.** Two reconnections were measured at
+4.036s and 4.034s from detach to found — but the search delay in effect was 4000ms, so those
+numbers only prove the dongle was *already back* at the 4s mark, not how much sooner. Had it
+needed longer, the log would show `dongle not in the device list — retry`, which does not
+appear. `tools/bench_reconnect.py` exists to measure this properly.
+
+## The dongle can wedge: enumerated, opened, and silent
+
+The failure that is hardest to diagnose, because nothing reports an error. The dongle appears
+on the bus, accepts the Open command, the session starts — and not a single byte comes back.
+Three consecutive launches in one session sat silent for 99s, 15s and 33s, with the screen
+reading `session started (800x480)` the whole time.
+
+Reopening the app does not fix it. Only cutting power to the dongle does: after the car was
+switched off and on, the device number jumped from 115 to 119 and it worked immediately.
+
+**Detection is a timeout, since there is no error to catch.** A healthy dongle reports its
+state about 1s after the session starts — measured 1.019s, 1.018s and 1.017s across three good
+sessions. The app waits 10s, an order of magnitude above that, then tells the user to power
+cycle the car.
+
+### Status messages are not a liveness signal
+
+The obvious implementation is to watch for the first status command. It is wrong.
+
+A session reopened while the phone is still connected receives **no status at all** and is
+perfectly healthy. One measured session had zero status messages and zero phone-connected
+events, yet the voice assistant was working 35s in. Keying the watchdog on status would have
+warned on a working setup.
+
+Liveness has to come from traffic: video, audio, or any protocol message. During active
+projection a bench capture measured **46.8 video packets/s and 12.3 audio packets/s** — a
+packet every 21ms — so absence of traffic is unambiguous while projecting. What is not yet
+measured is an idle link with the phone connected and the screen untouched, which is why the
+current check only fires when *nothing at all* was received on the session, rather than using
+a sliding window.
+
+## Two Android lifecycle traps on this head unit
+
+**The permission dialog runs `onResume`, before the permission broadcast arrives.** The dialog
+takes the focus away and gives it back, so any state reset in `onResume` happens *before* the
+answer is processed. Resetting retry counters there made every denial start over from zero, so
+the retry limit was never reached and the app reopened the dialog indefinitely. The log
+signature is the attempt counter never advancing: `permission denied on attempt 0` repeated.
+
+**The head unit kills the app process without calling `onDestroy`.** Cleanup that only runs in
+`onDestroy` does not run. This is why the USB connection lives in a Service rather than the
+Activity, and why absence of an `onDestroy` line in the log is itself evidence of a kill.
+
+## Retrieving logs: a trap worth knowing
+
+The app writes to a USB stick when one is mounted. On a PC, the stick can show up as *connected
+but not mounted* — the old mount directory stays behind, empty, giving the impression that the
+app never wrote anything. Check that the device is actually mounted before concluding the log
+is missing.
 
 ---
