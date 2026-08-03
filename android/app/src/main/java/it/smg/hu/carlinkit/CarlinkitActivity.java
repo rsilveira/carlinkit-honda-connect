@@ -321,6 +321,38 @@ public final class CarlinkitActivity extends Activity
     @Override
     protected void onPause() {
         super.onPause();
+        // Registrado porque sem isto o log nao distingue as hipoteses de morte do app.
+        //
+        // Tres sessoes de 03/Ago terminaram no meio de uma linha normal, sem
+        // onBackPressed e sem excecao. Isso e compativel com pelo menos tres causas
+        // diferentes, e o log atual nao separa nenhuma delas:
+        //
+        //   a) o head unit mata o processo (SIGKILL) — nao ha o que registrar
+        //   b) crash NATIVO no decoder OMX (SIGSEGV em C++) — o
+        //      UncaughtExceptionHandler e Java e nao captura
+        //   c) o app foi para segundo plano e morreu lá
+        //
+        // Com onPause/onStop/onResume no log: se a ultima linha for onPause, o app
+        // saiu de cena antes de morrer (marcha a re assumindo a tela). Se a ultima
+        // linha for um evento normal de sessao, morreu em primeiro plano, e aí a
+        // suspeita recai sobre o decoder nativo.
+        logBoth("onPause (app saindo de primeiro plano)");
+        onPauseHondaCleanup();
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        logBoth("onStop (app nao esta mais visivel)");
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        logBoth("onStart");
+    }
+
+    private void onPauseHondaCleanup() {
         if (hondaEnabled()) {
             try {
                 HondaConnectManager.instance().sendToBackground();
@@ -404,6 +436,7 @@ public final class CarlinkitActivity extends Activity
         // Pending delayed work outlives the Activity and would run against a dead one.
         if (surfaceView != null) {
             surfaceView.removeCallbacks(muteDongleCheck);
+            surfaceView.removeCallbacks(sessionHeartbeat);
         }
         if (serviceBound) {
             try {
@@ -471,6 +504,37 @@ public final class CarlinkitActivity extends Activity
             }
         }, DONGLE_RECONNECT_DELAY_MS);
     }
+
+    /**
+     * Marca no log que a sessao seguia viva, a cada 30 s.
+     *
+     * Sem isto, uma sessao que morre em silencio deixa como ultima linha o ultimo
+     * comando de volante — que pode ter sido minutos antes. Nao se sabe se o app ficou
+     * parado esse tempo ou se morreu no instante seguinte ao comando.
+     *
+     * Com o marcador, a distancia entre a ultima linha e o horario real da morte cai
+     * para no maximo 30 s, e o texto registra o estado interno naquele momento: se o
+     * dongle ainda enviava dados e se o telefone estava conectado. Uma morte com
+     * trafego normal aponta para causa externa (kill do head unit) ou nativa (decoder);
+     * uma morte apos o trafego cessar aponta para o proprio enlace.
+     */
+    private static final int HEARTBEAT_MS = 30000;
+
+    private final Runnable sessionHeartbeat = new Runnable() {
+        @Override
+        public void run() {
+            if (!sessionStarted || userLeft) {
+                return;
+            }
+            CarlinkitSession sess = session();
+            CarlinkitFileLog.log(TAG, "vivo | dongle enviando="
+                    + (sess != null && sess.hasReceivedData())
+                    + " telefone=" + phoneConnected);
+            if (surfaceView != null) {
+                surfaceView.postDelayed(this, HEARTBEAT_MS);
+            }
+        }
+    };
 
     /**
      * Warns when the dongle enumerates, accepts a session and then stays silent.
@@ -601,6 +665,8 @@ public final class CarlinkitActivity extends Activity
         // Arm the mute-dongle check: a healthy dongle answers in about 1s.
         surfaceView.removeCallbacks(muteDongleCheck);
         surfaceView.postDelayed(muteDongleCheck, DONGLE_MUTE_TIMEOUT_MS);
+        surfaceView.removeCallbacks(sessionHeartbeat);
+        surfaceView.postDelayed(sessionHeartbeat, HEARTBEAT_MS);
         CarlinkitSession sess = session();
         if (sess != null) {
             sess.onSurfaceReady();
@@ -616,6 +682,7 @@ public final class CarlinkitActivity extends Activity
         sessionStarted = false;
         if (surfaceView != null) {
             surfaceView.removeCallbacks(muteDongleCheck);
+            surfaceView.removeCallbacks(sessionHeartbeat);
         }
         if (service != null) {
             service.detachSurface();
