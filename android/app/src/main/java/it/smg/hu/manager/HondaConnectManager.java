@@ -34,6 +34,7 @@ import java.util.List;
 import it.smg.hu.config.Settings;
 import it.smg.libs.aasdk.messenger.ChannelId;
 import it.smg.libs.common.Log;
+import it.smg.hu.carlinkit.CarlinkitFileLog;
 
 public class HondaConnectManager {
 
@@ -829,6 +830,10 @@ public class HondaConnectManager {
         @Override
         public boolean onFinishView(boolean flg, boolean anime) throws RemoteException {
             if (Log.isVerbose()) Log.v(TAG, "onFinishView");
+            // Registrado porque pode ser o aviso que antecede o kill do processo. Se
+            // aparecer no log imediatamente antes de uma sessao terminar sem
+            // onBackPressed, e o gancho para sair graciosamente em vez de ser morto.
+            CarlinkitFileLog.log(TAG, "onFinishView(flg=" + flg + ", anime=" + anime + ")");
             return true;
         }
 
@@ -868,6 +873,58 @@ public class HondaConnectManager {
                 for (HondaListener l : listenersCopy) {
                     l.onDayNightUpdate(isNight);
                 }
+            }
+            reportVehicleStateChange(stateMgrInfo);
+        }
+
+        /**
+         * Records the head unit state changes that precede the app being killed.
+         *
+         * Why this exists: on 03/Aug/2026 three sessions ended mid-line with no
+         * onBackPressed, no onDestroy and no exception — the signature of the process
+         * being killed by the head unit, not of an application fault. Two of them had
+         * been running for over 80 minutes, which is when reverse gear gets used, at the
+         * end of a trip. But the log has no record of the reverse event itself, because
+         * the app is killed before it can write anything.
+         *
+         * The head unit does report the relevant transitions: parkingSensor (the parking
+         * sensor arms when reverse is engaged) and videoAddress (the video source changes
+         * when the reverse camera takes the screen). The app was only ever listening to
+         * dayNightStateC.
+         *
+         * This only LOGS, on purpose. Reacting to the signal — releasing the surface and
+         * the audio to exit gracefully — is only worth writing once the log confirms which
+         * field fires and in what order relative to the kill.
+         */
+        private void reportVehicleStateChange(StateMgrInfo info) {
+            try {
+                StringBuilder sb = null;
+                if (info.updateState.parkingSensorC) {
+                    sb = new StringBuilder("head unit state: parkingSensor=")
+                            .append(info.parkingSensor);
+                }
+                if (info.updateState.videoAddressC) {
+                    if (sb == null) sb = new StringBuilder("head unit state:");
+                    else sb.append(" |");
+                    sb.append(" videoAddress=").append(info.videoAddress)
+                      .append(" (last=").append(info.lastVideoAddress).append(")");
+                }
+                if (info.updateState.screenOffC) {
+                    if (sb == null) sb = new StringBuilder("head unit state:");
+                    else sb.append(" |");
+                    sb.append(" screenOff=").append(info.screenOff);
+                }
+                if (info.updateState.sourceFlowC) {
+                    if (sb == null) sb = new StringBuilder("head unit state:");
+                    else sb.append(" |");
+                    sb.append(" sourceFlow=").append(info.sourceFlow);
+                }
+                if (sb != null) {
+                    CarlinkitFileLog.log(TAG, sb.toString());
+                }
+            } catch (Throwable t) {
+                // Nao deixar a instrumentacao derrubar o callback de estado.
+                Log.e(TAG, "failed to report vehicle state", t);
             }
         }
     }
