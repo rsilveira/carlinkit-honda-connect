@@ -332,8 +332,8 @@ public class HondaConnectManager {
         if (Log.isDebug()) Log.d(TAG, "requestAudioFocus -> app with auth " + pControl_.authType);
         if (Log.isVerbose()) Log.v(TAG, "requestAudioFocus modeMgr audio hasAudioFocus= " + hasAudioFocus_);
 
-        // Vale para qualquer authType: apps THIRD_PARTY tambem precisam anunciar ao
-        // ModeMgr que assumiram o modo, senao a central nao entrega os eventos do volante.
+        // Applies to any authType: THIRD_PARTY apps also have to announce to ModeMgr that
+        // they took over the mode, otherwise the unit does not deliver steering wheel events.
         if (!hasAudioFocus_) {
             int idx = settings_.advanced.modeMgrAudioIdx();
             int ret;
@@ -394,8 +394,8 @@ public class HondaConnectManager {
             if (Log.isVerbose()) Log.v(TAG, "releaseAudioFocus sendModeMgrOffReq ret= " + ret);
 
             try {
-                // Informa ao ModeMgr que o app esta realmente OFF; sem isto o radio FM
-                // nativo nao retoma ao sair do app.
+                // Tells ModeMgr the app really is OFF. Without this the native FM radio does
+                // not resume when leaving the app.
                 modeMgrManager_.notifyModeMgrStatus(idx, 0);
             } catch (Throwable t) {
                 Log.w(TAG, "Could not notify ModeMgr status OFF", t);
@@ -452,7 +452,7 @@ public class HondaConnectManager {
 
         // Recuperacao pos deep-sleep: se um servico morreu, refaz o bind
         if (!boundToSteeringMenuService_) {
-            Log.w(TAG, "initAudioBinding -> wheel service nao esta bound, tentando religar");
+            Log.w(TAG, "initAudioBinding -> wheel service is not bound, rebinding");
             bindToWheelService();
         }
         if (!boundToEcNcService_) {
@@ -830,9 +830,9 @@ public class HondaConnectManager {
         @Override
         public boolean onFinishView(boolean flg, boolean anime) throws RemoteException {
             if (Log.isVerbose()) Log.v(TAG, "onFinishView");
-            // Registrado porque pode ser o aviso que antecede o kill do processo. Se
-            // aparecer no log imediatamente antes de uma sessao terminar sem
-            // onBackPressed, e o gancho para sair graciosamente em vez de ser morto.
+            // Logged because it may be the warning that precedes the process being killed.
+            // If it shows up immediately before a session ends without onBackPressed, this is
+            // the hook for exiting gracefully instead of being killed.
             CarlinkitFileLog.log(TAG, "onFinishView(flg=" + flg + ", anime=" + anime + ")");
             return true;
         }

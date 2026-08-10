@@ -3,6 +3,7 @@ package it.smg.hu.carlinkit;
 import android.app.Activity;
 import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
+import android.content.ComponentCallbacks2;
 import android.content.Context;
 import android.content.Intent;
 import android.content.ComponentName;
@@ -321,35 +322,99 @@ public final class CarlinkitActivity extends Activity
     @Override
     protected void onPause() {
         super.onPause();
-        // Registrado porque sem isto o log nao distingue as hipoteses de morte do app.
+        // Logged because without it the log cannot tell the death hypotheses apart.
         //
-        // Tres sessoes de 03/Ago terminaram no meio de uma linha normal, sem
-        // onBackPressed e sem excecao. Isso e compativel com pelo menos tres causas
-        // diferentes, e o log atual nao separa nenhuma delas:
+        // Three sessions on Aug 3 ended in the middle of an ordinary line, with no
+        // onBackPressed and no exception. That is consistent with at least three different
+        // causes, and the logging at the time separated none of them:
         //
-        //   a) o head unit mata o processo (SIGKILL) — nao ha o que registrar
-        //   b) crash NATIVO no decoder OMX (SIGSEGV em C++) — o
-        //      UncaughtExceptionHandler e Java e nao captura
-        //   c) o app foi para segundo plano e morreu lá
+        //   a) the head unit kills the process (SIGKILL), leaving nothing to log
+        //   b) a NATIVE crash in the OMX decoder (SIGSEGV in C++), which the
+        //      UncaughtExceptionHandler cannot catch because it is Java
+        //   c) the app went to the background and died there
         //
-        // Com onPause/onStop/onResume no log: se a ultima linha for onPause, o app
-        // saiu de cena antes de morrer (marcha a re assumindo a tela). Se a ultima
-        // linha for um evento normal de sessao, morreu em primeiro plano, e aí a
-        // suspeita recai sobre o decoder nativo.
-        logBoth("onPause (app saindo de primeiro plano)");
+        // With onPause/onStop/onResume in the log: if the last line is onPause, the app left
+        // the foreground before dying (reverse gear taking over the screen). If the last line
+        // is an ordinary session event, it died in the foreground, and suspicion falls on the
+        // native decoder.
+        logBoth("onPause (app leaving the foreground)");
         onPauseHondaCleanup();
     }
 
     @Override
     protected void onStop() {
         super.onStop();
-        logBoth("onStop (app nao esta mais visivel)");
+        logBoth("onStop (app no longer visible)");
     }
 
     @Override
     protected void onStart() {
         super.onStart();
         logBoth("onStart");
+    }
+
+    /**
+     * Logs the warning Android issues BEFORE killing the process for lack of memory.
+     *
+     * This is the signal that finally separates the two remaining hypotheses for the death
+     * when reverse gear is disengaged. In four sessions on Aug 6 the process died with no
+     * onPause, no onStop and no exception, with the heartbeat at an exact 30.0s cadence right
+     * up to the last line. The absence of any degradation already makes memory pressure
+     * unlikely, because aggressive garbage collection would delay the timer, but that is
+     * inference rather than evidence.
+     *
+     * With onTrimMemory and onLowMemory instrumented the conclusion becomes direct:
+     *
+     *   - if increasing levels appear before the death, it was the lowmemorykiller, and the
+     *     fix is to reduce the memory footprint or make the process less killable;
+     *   - if nothing appears, the system never asked for memory and the death came from
+     *     outside Java: SIGSEGV in the native decoder, or a SIGKILL from the head unit.
+     *
+     * TRIM_MEMORY_COMPLETE is the last warning: it means this process is next to be killed.
+     */
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        logBoth("onTrimMemory: " + trimLevelName(level) + " (" + level + ")");
+    }
+
+    @Override
+    public void onLowMemory() {
+        super.onLowMemory();
+        logBoth("onLowMemory: system low on memory, the process may be killed");
+    }
+
+    /**
+     * Android calls this before killing a process that can be restored later.
+     *
+     * It serves the same purpose as onTrimMemory: if the line shows up immediately before the
+     * end of the log, the death was ordered by the system rather than a native crash.
+     */
+    @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        super.onSaveInstanceState(outState);
+        logBoth("onSaveInstanceState: the system intends to destroy the Activity");
+    }
+
+    private static String trimLevelName(int level) {
+        switch (level) {
+            case ComponentCallbacks2.TRIM_MEMORY_COMPLETE:
+                return "COMPLETE (next to be killed)";
+            case ComponentCallbacks2.TRIM_MEMORY_MODERATE:
+                return "MODERATE";
+            case ComponentCallbacks2.TRIM_MEMORY_BACKGROUND:
+                return "BACKGROUND";
+            case ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN:
+                return "UI_HIDDEN";
+            case ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL:
+                return "RUNNING_CRITICAL";
+            case ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW:
+                return "RUNNING_LOW";
+            case ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE:
+                return "RUNNING_MODERATE";
+            default:
+                return "unknown";
+        }
     }
 
     private void onPauseHondaCleanup() {
@@ -407,10 +472,25 @@ public final class CarlinkitActivity extends Activity
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
+        // Logged always, not only on error, because losing focus is the only Java signal
+        // that would remain if reverse gear does not produce an onPause.
+        //
+        // In the four deaths on Aug 6 there was no onPause, no onStop and no
+        // surfaceDestroyed: the log ends at a heartbeat with the dongle still sending data
+        // normally. That is consistent with the head unit switching the camera video in
+        // HARDWARE, outside the Android lifecycle, leaving the app decoding without knowing
+        // it lost the screen. But it is equally consistent with a focus change that the
+        // current logging throws away, because this method only wrote a line when the wheel
+        // service was not bound.
+        //
+        // If "focus lost" shows up when reverse is engaged, an Android event does exist and
+        // the switch is not purely hardware. If nothing shows up, the hardware hypothesis
+        // gains weight and suspicion falls on the native decoder, which dies in C++ without
+        // passing through the UncaughtExceptionHandler.
+        CarlinkitFileLog.log(TAG, "focus " + (hasFocus ? "gained" : "lost"));
         if (hasFocus && hondaEnabled()) {
             try {
                 HondaConnectManager.instance().initAudioBinding();
-                // Silent on success: this runs on every focus change and added nothing
                 if (!HondaConnectManager.instance().isWheelServiceBound()) {
                     CarlinkitFileLog.log(TAG, "focus regained but the wheel service is NOT bound");
                 }
@@ -506,19 +586,31 @@ public final class CarlinkitActivity extends Activity
     }
 
     /**
-     * Marca no log que a sessao seguia viva, a cada 30 s.
+     * Marks in the log that the session was still alive.
      *
-     * Sem isto, uma sessao que morre em silencio deixa como ultima linha o ultimo
-     * comando de volante — que pode ter sido minutos antes. Nao se sabe se o app ficou
-     * parado esse tempo ou se morreu no instante seguinte ao comando.
+     * Without this, a session that dies silently leaves the last steering wheel command as
+     * its final line, and that may have been minutes earlier. There is no way to tell whether
+     * the app sat idle for that time or died right after the command.
      *
-     * Com o marcador, a distancia entre a ultima linha e o horario real da morte cai
-     * para no maximo 30 s, e o texto registra o estado interno naquele momento: se o
-     * dongle ainda enviava dados e se o telefone estava conectado. Uma morte com
-     * trafego normal aponta para causa externa (kill do head unit) ou nativa (decoder);
-     * uma morte apos o trafego cessar aponta para o proprio enlace.
+     * With the marker, the gap between the last line and the real time of death shrinks to at
+     * most one interval, and the text records the internal state at that moment: whether the
+     * dongle was still sending data and whether the phone was connected. A death with normal
+     * traffic points to an external cause (a kill by the head unit) or a native one (the
+     * decoder); a death after traffic stops points at the link itself.
+     *
+     * The interval went from 30s to 5s because 30s is too coarse for the event under
+     * investigation. In four sessions on Aug 6 the app died with the heartbeat at a perfect
+     * cadence, 30.0s exactly, without a single pause, and the last line landed 17s, 39s and
+     * 109s away from the last real event. Reversing out of a parking space takes a few
+     * seconds, so the whole manoeuvre fitted inside the blind window. At 5s the window is
+     * shorter than the manoeuvre, and any degradation in the final moments (GC pauses, timer
+     * delay) stops being invisible.
+     *
+     * Cost: 6x more lines in the file. A real 35 min session produced 69 lines at 30s, so at
+     * 5s it would be around 420. Acceptable while investigating, but worth putting back to
+     * 30s once the cause is known.
      */
-    private static final int HEARTBEAT_MS = 30000;
+    private static final int HEARTBEAT_MS = 5000;
 
     private final Runnable sessionHeartbeat = new Runnable() {
         @Override
@@ -527,9 +619,9 @@ public final class CarlinkitActivity extends Activity
                 return;
             }
             CarlinkitSession sess = session();
-            CarlinkitFileLog.log(TAG, "vivo | dongle enviando="
+            CarlinkitFileLog.log(TAG, "alive | dongle sending="
                     + (sess != null && sess.hasReceivedData())
-                    + " telefone=" + phoneConnected);
+                    + " phone=" + phoneConnected);
             if (surfaceView != null) {
                 surfaceView.postDelayed(this, HEARTBEAT_MS);
             }
