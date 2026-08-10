@@ -96,7 +96,22 @@ public final class CarlinkitActivity extends Activity
      * attempt the app says so instead of looping.
      */
     private int dongleReconnectAttempts;
-    private static final int MAX_DONGLE_RECONNECT_ATTEMPTS = 1;
+    /**
+     * Reconnection attempts allowed inside RECONNECT_WINDOW_MS.
+     *
+     * It was 1, and on 10/Aug that cost a physical removal of the dongle: it dropped three
+     * times in 22s, the app gave up after the first retry and only unplugging brought it
+     * back. The limit exists to stop a cascade (see "Stop the reconnection cascade"), and a
+     * cascade is many attempts in a few seconds, not a few attempts spread over a trip.
+     *
+     * So the counter is now bounded by a time window: attempts older than the window do not
+     * count. A dongle that misbehaves once every couple of minutes gets recovered
+     * indefinitely, while a genuine loop still hits the ceiling and shows the power cycle
+     * message.
+     */
+    private static final int MAX_DONGLE_RECONNECT_ATTEMPTS = 5;
+    private static final long RECONNECT_WINDOW_MS = 120000;
+    private long firstReconnectAttemptAt;
     /**
      * How long to wait for the first status message before declaring the dongle mute.
      *
@@ -278,6 +293,7 @@ public final class CarlinkitActivity extends Activity
             usbPermissionAttempts = 0;
             dongleSearchAttempts = 0;
             dongleReconnectAttempts = 0;
+            firstReconnectAttemptAt = 0;
         }
         // The app is in the foreground: any previous exit (including going to the
         // Settings) no longer applies.
@@ -302,8 +318,18 @@ public final class CarlinkitActivity extends Activity
                 // with the value that works in OpenDroidAuto.
                 if (!wheelDiagLogged) {
                     wheelDiagLogged = true;
-                    // Once per app start: these values never change while running
+                    // NOTE ON READING THIS LINE: wheelServiceBound is almost always false
+                    // here, and that does NOT mean the bind failed. bindService is
+                    // asynchronous and onServiceConnected lands 13 to 30ms later, always
+                    // after this line. Measured on 10/Aug across four sessions:
+                    //
+                    //     08:58:13.520  wheelServiceBound=false     <- this line
+                    //     08:58:13.550  wheel service CONNECTED     <- 30ms later
+                    //
+                    // Reading the two independently is what produced the wrong conclusion
+                    // that the bind failed in 7 of 7 sessions. Trust the CONNECTED line.
                     logBoth("wheelServiceBound=" + HondaConnectManager.instance().isWheelServiceBound()
+                            + " (async, see the CONNECTED line below)"
                             + " hasAudioFocus=" + HondaConnectManager.instance().hasAudioFocus()
                             + " steeringWheelIdx=" + Settings.instance().advanced.steeringWheelIdx()
                             + " modeMgrAudioIdx=" + Settings.instance().advanced.modeMgrAudioIdx()
@@ -478,23 +504,43 @@ public final class CarlinkitActivity extends Activity
     @Override
     public void onWindowFocusChanged(boolean hasFocus) {
         super.onWindowFocusChanged(hasFocus);
-        // Logged always, not only on error, because losing focus is the only Java signal
-        // that would remain if reverse gear does not produce an onPause.
+        // MEASURED on 10/Aug, and this is now the trigger for the reverse gear defence.
         //
-        // In the four deaths on Aug 6 there was no onPause, no onStop and no
-        // surfaceDestroyed: the log ends at a heartbeat with the dongle still sending data
-        // normally. That is consistent with the head unit switching the camera video in
-        // HARDWARE, outside the Android lifecycle, leaving the app decoding without knowing
-        // it lost the screen. But it is equally consistent with a focus change that the
-        // current logging throws away, because this method only wrote a line when the wheel
-        // service was not bound.
+        // Engaging reverse produces exactly one Java event and nothing else:
         //
-        // If "focus lost" shows up when reverse is engaged, an Android event does exist and
-        // the switch is not purely hardware. If nothing shows up, the hardware hypothesis
-        // gains weight and suspicion falls on the native decoder, which dies in C++ without
-        // passing through the UncaughtExceptionHandler.
+        //     09:02:17.482  alive | dongle sending=true phone=false
+        //     09:02:18.435  focus lost
+        //     (log ends, process dead)
+        //
+        // No onPause, no onStop, no onTrimMemory, no onSaveInstanceState. Compare with the
+        // TALK button on the same day, where the head unit took the screen through the normal
+        // path and produced onUserLeaveHint, onPause, focus lost, surfaceDestroyed and onStop
+        // in order. Two different mechanisms: reverse gear puts a window on top WITHOUT
+        // pausing the Activity, which is why onPause never arrives.
+        //
+        // The StateMgr route was tried first and is not viable: the head unit reports
+        // dayNightState (10 events that day) but never parkingSensor or videoAddress, so
+        // there is no vehicle signal to react to. Focus is what we get.
         CarlinkitFileLog.log(TAG, "focus " + (hasFocus ? "gained" : "lost"));
-        if (hasFocus && hondaEnabled()) {
+        CarlinkitSession sess = session();
+        if (!hasFocus) {
+            // Pause the native decoder. It is the prime suspect for the death: OMX writing
+            // into a Surface the head unit reclaimed for the camera, a SIGSEGV in C++ that no
+            // Java handler catches. Audio keeps playing, as the native sources do in reverse.
+            //
+            // Deliberately NOT filtered by "was it really reverse gear": any loss of focus
+            // means something is on top of us, and feeding the decoder in that state buys
+            // nothing. The cost of a false positive is one keyframe on the way back.
+            if (sess != null) {
+                sess.onScreenTakenByHeadUnit(true);
+                CarlinkitFileLog.log(TAG, "focus lost -> video decoder paused (protection)");
+            }
+            return;
+        }
+        if (sess != null) {
+            sess.onScreenTakenByHeadUnit(false);
+        }
+        if (hondaEnabled()) {
             try {
                 HondaConnectManager.instance().initAudioBinding();
                 if (!HondaConnectManager.instance().isWheelServiceBound()) {
@@ -562,13 +608,25 @@ public final class CarlinkitActivity extends Activity
         if (userLeft) {
             return;
         }
+        // Sliding window: attempts that happened long ago do not count towards the ceiling,
+        // so a dongle that hiccups once in a while keeps being recovered.
+        long agora = android.os.SystemClock.elapsedRealtime();
+        if (firstReconnectAttemptAt > 0 && agora - firstReconnectAttemptAt > RECONNECT_WINDOW_MS) {
+            logBoth("reconnection window expired ("
+                    + ((agora - firstReconnectAttemptAt) / 1000) + "s), counter reset");
+            dongleReconnectAttempts = 0;
+            firstReconnectAttemptAt = 0;
+        }
         if (dongleReconnectAttempts >= MAX_DONGLE_RECONNECT_ATTEMPTS) {
             // Beyond this point the dongle needs a power cycle, not another open attempt.
-            logBoth("dongle dropped again after " + dongleReconnectAttempts
-                    + " reconnection — not retrying");
+            logBoth("dongle dropped " + dongleReconnectAttempts + " times in "
+                    + ((agora - firstReconnectAttemptAt) / 1000) + "s, not retrying");
             setStatus("The dongle keeps restarting.\n"
                     + "Turn the car off and on again.");
             return;
+        }
+        if (firstReconnectAttemptAt == 0) {
+            firstReconnectAttemptAt = agora;
         }
         dongleReconnectAttempts++;
         // A dialog left open would block the search forever, since findAndOpenDongle()
@@ -662,6 +720,7 @@ public final class CarlinkitActivity extends Activity
                 // Healthy session: the failure episode is over, so a later drop gets a
                 // fresh reconnection attempt.
                 dongleReconnectAttempts = 0;
+                firstReconnectAttemptAt = 0;
                 return;
             }
             logBoth("dongle opened but sent nothing in "

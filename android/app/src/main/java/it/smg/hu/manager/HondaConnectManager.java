@@ -674,16 +674,23 @@ public class HondaConnectManager {
     }
 
     /**
-     * Binds to the steering wheel service. This bind NEVER succeeded in any logged session
-     * (wheelServiceBound=false in 7 of 7 on Aug 6), and the original code ignored the boolean
-     * that bindService returns, so it failed without leaving a trace.
+     * Binds to the steering wheel service.
      *
-     * The likely cause is intent resolution: the bind uses an implicit intent whose action is
-     * the interface name, which only works if some system service declares that action in an
-     * intent-filter. This version logs the resolution, and when the implicit intent matches
-     * nothing it searches the installed packages for a service whose name contains
-     * "SteeringMenu" and retries with an explicit component. Every step goes to the file log,
-     * so the car test tells us which case we are in.
+     * MEASURED on 10/Aug: the implicit intent resolves to exactly one service and needs no
+     * permission, and the bind succeeds every time:
+     *
+     *     action resolves to 1 service(s)
+     *     match com.fujitsu_ten.displayaudio.steeringmenuservice/....SteeringMenuService perm=null
+     *     bindService(...) returned true
+     *     wheel service CONNECTED
+     *
+     * So this bind was never the problem. The diagnostic that suggested otherwise was reading
+     * a synchronous flag before the asynchronous callback arrived.
+     *
+     * The resolution logging stays because it costs one line per start and answers, without a
+     * second trip to the car, whether a firmware update ever moves or renames the service. It
+     * also picks the explicit component, which removes any ambiguity if a future firmware ships
+     * more than one match.
      */
     private void bindToWheelService(){
         if (boundToSteeringMenuService_) {
@@ -691,28 +698,20 @@ public class HondaConnectManager {
         }
         String action = ISteeringMenuService.class.getName();
         Intent intent = new Intent(action);
-
-        // Diagnostic: what does the implicit intent resolve to?
         try {
             android.content.pm.PackageManager pm = context_.getPackageManager();
             java.util.List<android.content.pm.ResolveInfo> matches =
                     pm.queryIntentServices(intent, 0);
-            CarlinkitFileLog.log(TAG, "wheel service: action resolves to "
-                    + (matches == null ? 0 : matches.size()) + " service(s)");
             if (matches != null && !matches.isEmpty()) {
                 android.content.pm.ServiceInfo si = matches.get(0).serviceInfo;
-                CarlinkitFileLog.log(TAG, "wheel service: match " + si.packageName
-                        + "/" + si.name + " perm=" + si.permission);
-                // Explicit component avoids ambiguity when more than one matches
                 intent.setClassName(si.packageName, si.name);
-            } else {
-                ComponentName found = findSteeringServiceComponent(pm);
-                if (found != null) {
-                    CarlinkitFileLog.log(TAG, "wheel service: found by scan "
-                            + found.flattenToShortString() + ", binding explicitly");
-                    intent = new Intent(action);
-                    intent.setComponent(found);
+                if (matches.size() != 1) {
+                    CarlinkitFileLog.log(TAG, "wheel service: " + matches.size()
+                            + " matches, using " + si.packageName + "/" + si.name);
                 }
+            } else {
+                CarlinkitFileLog.log(TAG, "wheel service: action resolves to NOTHING"
+                        + " (it resolved to 1 service on 10/Aug; did the firmware change?)");
             }
         } catch (Throwable t) {
             CarlinkitFileLog.log(TAG, "wheel service: resolution query failed", t);
@@ -721,43 +720,12 @@ public class HondaConnectManager {
         try {
             boolean requested = context_.bindService(
                     intent, steeringMenuServiceConnection_, Context.BIND_AUTO_CREATE);
-            CarlinkitFileLog.log(TAG, "wheel service: bindService("
-                    + (intent.getComponent() == null
-                        ? "implicit" : intent.getComponent().flattenToShortString())
-                    + ") returned " + requested);
+            if (!requested) {
+                CarlinkitFileLog.log(TAG, "wheel service: bindService returned FALSE");
+            }
         } catch (Throwable t) {
-            // A SecurityException here means the service exists but requires a permission
-            // we do not hold; that is a different fix (whitelist/permission), so log it apart
             CarlinkitFileLog.log(TAG, "wheel service: bindService threw", t);
         }
-    }
-
-    /**
-     * Scans installed packages for a service whose class name contains "SteeringMenu".
-     * One-shot diagnostic for the head unit, where we cannot run adb: it discovers the real
-     * component name of the wheel service, whatever package Fujitsu Ten put it in.
-     */
-    private ComponentName findSteeringServiceComponent(android.content.pm.PackageManager pm) {
-        try {
-            java.util.List<android.content.pm.PackageInfo> pkgs = pm.getInstalledPackages(
-                    android.content.pm.PackageManager.GET_SERVICES);
-            for (android.content.pm.PackageInfo p : pkgs) {
-                if (p.services == null) continue;
-                for (android.content.pm.ServiceInfo s : p.services) {
-                    if (s.name != null && s.name.toLowerCase().contains("steeringmenu")) {
-                        CarlinkitFileLog.log(TAG, "wheel service: candidate "
-                                + s.packageName + "/" + s.name
-                                + " exported=" + s.exported + " perm=" + s.permission);
-                        return new ComponentName(s.packageName, s.name);
-                    }
-                }
-            }
-            CarlinkitFileLog.log(TAG, "wheel service: no candidate in "
-                    + pkgs.size() + " packages");
-        } catch (Throwable t) {
-            CarlinkitFileLog.log(TAG, "wheel service: package scan failed", t);
-        }
-        return null;
     }
 
     private void unbindToWheelService(){
@@ -840,9 +808,13 @@ public class HondaConnectManager {
                     idx, modeMgrServiceSWKeyEventCallBack_);
             CarlinkitFileLog.log(TAG, "registerModeMgrSWKeyEventCallback(idx=" + idx
                     + ") ret=" + ret);
-            if (ret != 0) {
-                // Non-zero smells like refusal; leave it unregistered so the next
-                // initAudioBinding retries.
+            // The framework echoes the index back on success, so ret == idx means it worked.
+            // Treating "ret != 0" as failure (the first version of this code) made the
+            // callback be discarded and re-registered on every initAudioBinding: 15 times in
+            // four sessions on 10/Aug, all of them successful registrations thrown away.
+            if (ret != idx && ret != 0) {
+                CarlinkitFileLog.log(TAG, "SWKey registration refused (ret=" + ret
+                        + ", expected " + idx + ")");
                 modeMgrServiceSWKeyEventCallBack_ = null;
             }
         } catch (Throwable t) {
@@ -1037,25 +1009,16 @@ public class HondaConnectManager {
         /**
          * Reacts to the head unit state changes around reverse gear.
          *
-         * Why this exists: on 03/Aug/2026 three sessions ended mid-line with no
-         * onBackPressed, no onDestroy and no exception — the signature of the process
-         * being killed by the head unit, not of an application fault. Two of them had
-         * been running for over 80 minutes, which is when reverse gear gets used, at the
-         * end of a trip. The suspected mechanism is the native OMX decoder writing into a
-         * Surface the head unit reclaimed by hardware for the camera: a SIGSEGV in C++
-         * that no Java handler can catch.
+         * ⚠️ MEASURED on 10/Aug: this head unit does NOT report parkingSensor nor
+         * videoAddress. Four sessions, zero "head unit state" lines, while dayNightState
+         * arrived 10 times in the same logs. The callback is alive and the unit simply does
+         * not publish the vehicle fields, so this route never fires here and the reverse gear
+         * defence had to move to onWindowFocusChanged, which does fire.
          *
-         * The head unit does report the relevant transitions: parkingSensor (the parking
-         * sensor arms when reverse is engaged) and videoAddress (the video source changes
-         * when the reverse camera takes the screen). The app was only ever listening to
-         * dayNightStateC.
-         *
-         * The exact semantics of the two fields are undocumented, so the reaction is
-         * defensive and reversible: pausing the video decoder is harmless if triggered by
-         * mistake (audio keeps playing, and resuming reinjects SPS/PPS and requests a
-         * keyframe, both idempotent). Every raw value is still logged, so the car test
-         * refines the mapping. A false NEGATIVE costs nothing new: it is exactly the
-         * behaviour before this code existed.
+         * Kept in place for two reasons: it costs nothing when the fields never change, and
+         * it logs the raw values, so a firmware update that starts publishing them shows up
+         * in the log instead of staying invisible. If it ever does fire, the pause/resume it
+         * requests is the same idempotent operation the focus path uses.
          */
         private void reportVehicleStateChange(StateMgrInfo info) {
             try {

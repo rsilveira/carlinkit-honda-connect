@@ -23,12 +23,27 @@ Working in the car, verified on the target head unit:
 | Audio out (PCM → `AudioTrack`, all speakers) | working |
 | Touch input | working |
 | Steering wheel: volume, next/previous track | working |
-| Microphone: voice assistant | working |
-| Phone calls | working, handled by the car's own telephony (see below) |
 | Day/night following the headlights | working |
 | Android Auto (Android phone) | working |
 | CarPlay (iPhone) | working |
 | Returning to FM radio and back | working |
+| Phone calls | audio arrives, **outgoing voice does not** (under investigation) |
+| Steering wheel: phone / assistant buttons | command reaches the phone, but the head unit takes the screen in the same press |
+| Reverse gear | **kills the app**; defence implemented, not yet validated |
+
+Measured in the car on 10/Aug and still open, with the evidence in
+[docs/FINDINGS.md](docs/FINDINGS.md):
+
+- **Calls have no outgoing voice.** With the phone unpaired from the car's Bluetooth the call
+  correctly stays inside Android Auto and the far end is audible, but the microphone capture
+  does not reach them. The capture now logs signal amplitude, which will separate "the head
+  unit never routed the mic to the app" from "audio was captured and lost downstream".
+- **The phone and TALK buttons cannot keep the screen.** The command does reach the phone, and
+  the head unit switches to its own screen in the same gesture. It never calls `onFinishView`,
+  so there is no hook to refuse the transition.
+- **Reverse gear.** The only Java event it produces is a bare `focus lost`, with no `onPause`
+  and no `onTrimMemory`, and the process dies right after. The decoder is now paused on focus
+  loss; whether that is enough is unverified.
 
 Known limitations are listed in [docs/FINDINGS.md](docs/FINDINGS.md).
 

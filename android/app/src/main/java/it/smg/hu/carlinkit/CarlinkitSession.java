@@ -364,8 +364,11 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
         // The head unit must release the microphone (EcNc) before the capture
         boolean centralOk = callback == null || callback.onMicRequested(true);
         boolean started = mic.start();
-        Log.i(TAG, "microphone requested (cmd " + command + "): head unit="
-                + centralOk + " capture=" + started);
+        // In the file log, not only logcat: the head unit exposes no adb, and on 10/Aug this
+        // exact line was the one missing to explain a call where the far end heard nothing.
+        CarlinkitFileLog.log(TAG, "mic requested (cmd " + command + " = "
+                + (command == AudioMessage.Command.PHONECALL_START ? "PhonecallStart" : "SiriStart")
+                + "): head unit=" + centralOk + " capture=" + started);
     }
 
     private void stopMic() {
@@ -376,7 +379,7 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
         if (callback != null) {
             callback.onMicRequested(false);
         }
-        Log.i(TAG, "microphone stopped");
+        CarlinkitFileLog.log(TAG, "mic stopped, " + mic.bytesSent() + " bytes sent in total");
     }
 
     @Override

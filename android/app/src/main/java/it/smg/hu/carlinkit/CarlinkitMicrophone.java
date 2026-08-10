@@ -5,7 +5,6 @@ import android.media.AudioRecord;
 import android.media.MediaRecorder;
 
 import it.smg.libs.carlinkit.CarlinkitDriver;
-import it.smg.libs.common.Log;
 
 /**
  * Captures the microphone and sends it to the dongle, for the voice assistant and calls.
@@ -36,6 +35,12 @@ public final class CarlinkitMicrophone {
     private Thread thread;
     private volatile boolean running;
     private long bytesSent;
+    /** Which AudioSource the device accepted; the fallback path matters for diagnosis. */
+    private String sourceName = "?";
+    private long chunks;
+    /** Largest absolute sample seen in the session: 0 means the mic was never routed here. */
+    private int peakAll;
+    private long silentChunks;
 
     public CarlinkitMicrophone(CarlinkitDriver driver) {
         this.driver = driver;
@@ -53,7 +58,7 @@ public final class CarlinkitMicrophone {
         int minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
         if (minBuf <= 0) {
-            Log.e(TAG, "invalid getMinBufferSize: " + minBuf);
+            CarlinkitFileLog.log(TAG, "mic: invalid getMinBufferSize: " + minBuf);
             return false;
         }
         // Generous buffer: the head unit has a modest CPU and an overrun loses part of the phrase
@@ -66,26 +71,36 @@ public final class CarlinkitMicrophone {
                     SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT, bufSize);
             if (record.getState() != AudioRecord.STATE_INITIALIZED) {
-                Log.e(TAG, "AudioRecord did not initialize with VOICE_RECOGNITION, trying MIC");
+                CarlinkitFileLog.log(TAG, "mic: VOICE_RECOGNITION did not initialize, trying MIC");
                 releaseRecord();
                 record = new AudioRecord(MediaRecorder.AudioSource.MIC,
                         SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
                         AudioFormat.ENCODING_PCM_16BIT, bufSize);
                 if (record.getState() != AudioRecord.STATE_INITIALIZED) {
-                    Log.e(TAG, "AudioRecord did not initialize");
+                    CarlinkitFileLog.log(TAG, "mic: AudioRecord did NOT initialize with either source");
                     releaseRecord();
                     return false;
                 }
+                sourceName = "MIC";
+            } else {
+                sourceName = "VOICE_RECOGNITION";
             }
             record.startRecording();
+            if (record.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) {
+                CarlinkitFileLog.log(TAG, "mic: startRecording did NOT put the record in RECORDING state"
+                        + " (state=" + record.getRecordingState() + ")");
+            }
         } catch (Throwable t) {
-            Log.e(TAG, "failed to start the capture", t);
+            CarlinkitFileLog.log(TAG, "mic: failed to start the capture", t);
             releaseRecord();
             return false;
         }
 
         running = true;
         bytesSent = 0;
+        chunks = 0;
+        peakAll = 0;
+        silentChunks = 0;
         thread = new Thread(new Runnable() {
             @Override
             public void run() {
@@ -94,35 +109,108 @@ public final class CarlinkitMicrophone {
         }, "CarlinkitMic");
         thread.setPriority(Thread.MAX_PRIORITY - 1);
         thread.start();
-        Log.i(TAG, "capture started (" + SAMPLE_RATE + "Hz mono, buffer " + bufSize + "B)");
+        CarlinkitFileLog.log(TAG, "mic: capture started, source=" + sourceName
+                + " " + SAMPLE_RATE + "Hz mono buffer=" + bufSize + "B");
         return true;
+    }
+
+    /**
+     * Reports what the microphone actually captured, not merely that it was opened.
+     *
+     * Why the amplitude matters: on 10/Aug a call went through with the far end audible but
+     * the local voice never arriving. The log recorded "EcNc session started" and nothing
+     * more, because every message in this class went to logcat, which the head unit does not
+     * expose. Opening the device successfully says nothing about whether samples carry sound:
+     * if the head unit routes the microphone elsewhere, AudioRecord still reads happily and
+     * returns silence.
+     *
+     * peak is the largest absolute sample in the chunk, on the Int16 scale (max 32767):
+     *
+     *   peak 0            the device delivers digital zero, the microphone is not routed here
+     *   peak below ~150   only noise floor, nothing usable reaches the far end
+     *   peak 2000+        real speech
+     */
+    private void logAmplitude(byte[] buf, int n, int peak) {
+        double rms = 0;
+        int samples = n / 2;
+        for (int i = 0; i + 1 < n; i += 2) {
+            int s = (short) ((buf[i + 1] << 8) | (buf[i] & 0xff));
+            rms += (double) s * s;
+        }
+        rms = samples > 0 ? Math.sqrt(rms / samples) : 0;
+        CarlinkitFileLog.log(TAG, "mic: chunk " + chunks + " peak=" + peak
+                + " rms=" + (long) rms + (peak == 0 ? "  <-- DIGITAL SILENCE" : "")
+                + " bytesSent=" + bytesSent);
+    }
+
+    private static int peakOf(byte[] buf, int n) {
+        int peak = 0;
+        for (int i = 0; i + 1 < n; i += 2) {
+            int s = (short) ((buf[i + 1] << 8) | (buf[i] & 0xff));
+            int a = s < 0 ? -s : s;
+            if (a > peak) {
+                peak = a;
+            }
+        }
+        return peak;
     }
 
     private void captureLoop() {
         byte[] buf = new byte[CHUNK_SAMPLES * 2];
+        long sendFailures = 0;
         while (running) {
             int n;
             try {
                 n = record.read(buf, 0, buf.length);
             } catch (Throwable t) {
-                Log.e(TAG, "error reading the microphone", t);
+                CarlinkitFileLog.log(TAG, "mic: error reading the microphone", t);
                 break;
             }
             if (n <= 0) {
                 if (n == AudioRecord.ERROR_INVALID_OPERATION || n == AudioRecord.ERROR_BAD_VALUE) {
-                    Log.e(TAG, "AudioRecord.read returned " + n);
+                    CarlinkitFileLog.log(TAG, "mic: AudioRecord.read returned " + n);
                     break;
                 }
                 continue;
             }
+            chunks++;
+            int peak = peakOf(buf, n);
+            if (peak > peakAll) {
+                peakAll = peak;
+            }
+            if (peak == 0) {
+                silentChunks++;
+            }
+            // Chunks are 20ms, so 50 of them make a second. Log the first three (immediate
+            // answer on whether anything arrives at all) and then once per second.
+            if (chunks <= 3 || chunks % 50 == 0) {
+                logAmplitude(buf, n, peak);
+            }
             if (!driver.sendMicAudio(buf, n)) {
                 // A send failure usually means the dongle is restarting; it is not worth
                 // stopping the capture for that, the driver reopens the device.
+                sendFailures++;
+                if (sendFailures == 1 || sendFailures % 100 == 0) {
+                    CarlinkitFileLog.log(TAG, "mic: sendMicAudio failed " + sendFailures + "x");
+                }
                 continue;
             }
             bytesSent += n;
         }
-        Log.i(TAG, "capture stopped (" + bytesSent + " bytes sent)");
+        // Verdict in a single line, which is what matters when reading the log afterwards
+        String veredito;
+        if (chunks == 0) {
+            veredito = "NOTHING was read from the device";
+        } else if (peakAll == 0) {
+            veredito = "ALL chunks were digital silence: the head unit did not route the mic here";
+        } else if (peakAll < 150) {
+            veredito = "only noise floor (peak " + peakAll + "), no usable voice";
+        } else {
+            veredito = "real audio captured (peak " + peakAll + ")";
+        }
+        CarlinkitFileLog.log(TAG, "mic: capture stopped. " + veredito
+                + " | chunks=" + chunks + " silent=" + silentChunks
+                + " bytesSent=" + bytesSent + " sendFailures=" + sendFailures);
     }
 
     public synchronized void stop() {
@@ -144,7 +232,7 @@ public final class CarlinkitMicrophone {
                 record.stop();
             }
         } catch (Throwable t2) {
-            Log.e(TAG, "error stopping the capture", t2);
+            CarlinkitFileLog.log(TAG, "mic: error stopping the capture", t2);
         }
         releaseRecord();
     }

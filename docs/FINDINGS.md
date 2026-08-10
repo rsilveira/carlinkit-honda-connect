@@ -304,107 +304,143 @@ is missing.
 
 ---
 
-# Steering wheel: phone and assistant buttons (investigated Aug 9, 2026)
 
-Motivation: with the phone paired to the car over Bluetooth, calls are handled by the native
-telephony (see AUDIO-STREAM.md). Unpairing hands the call to Android Auto through the dongle,
-and then the wheel's phone/talk buttons only work if this app receives and forwards them.
+# Steering wheel, calls and reverse gear: measured in the car (Aug 10, 2026)
 
-## The wheel service never binds
+Four instrumented sessions, with the phone unpaired from the car's Bluetooth so that calls
+would go through Android Auto instead of the native telephony.
 
-`wheelServiceBound=false` in 7 of 7 logged sessions. The bind used an implicit intent whose
-action is the AIDL interface name (`...steeringmenuservice.service.ISteeringMenuService`) and
-ignored the boolean that `bindService` returns, so it failed silently since the fork. Nothing
-that works today depends on it: volume and track arrive as `KeyEvent`s.
+## ⚠️ Correction: the wheel service always bound
 
-The bind now logs the intent resolution (`queryIntentServices`), scans the installed packages
-for a service class containing "SteeringMenu" when the action resolves to nothing, retries
-with an explicit component when it finds one, and logs what `bindService` returns. Whatever
-the car says tomorrow identifies the failure mode:
+The previous version of this document claimed the bind to `ISteeringMenuService` "never
+succeeded, 7 of 7 sessions", based on `wheelServiceBound=false` in the diagnostic line. That
+conclusion was wrong, and the mistake is worth recording because it is easy to repeat.
+
+`bindService` is asynchronous. The diagnostic line runs in `onResume`; `onServiceConnected`
+lands 13 to 30 ms later. Reading the flag at that moment always shows false:
 
 ```
-"action resolves to 0 service(s)" + no candidate   the service is not an Android service
-                                                    reachable by apps; forget this route
-"found by scan ... bindService(...) returned false" exists but refuses; probably permission
-"bindService threw SecurityException"               exists, needs a permission we lack
-"wheel service CONNECTED"                           it worked; keyTypes 8/9/10 flow in
+08:58:13.520  wheelServiceBound=false     <- diagnostic line
+08:58:13.550  wheel service CONNECTED     <- 30ms later, in all four sessions
 ```
 
-## Three candidate routes, all instrumented
-
-The framework offers the buttons through up to three routes, and which one this head unit
-uses is unknown until it runs in the car. All three are now implemented and logged:
-
-1. **KeyEvent** (`dispatchKeyEvent`). Proven route: the keymap codes stored on the head unit
-   are exactly the framework constants (`KEYCODE_STRG_*`, base -65536), and volume/track
-   already work through it. Added: `PICKUP` (-65528), `TALK` (-65526), plus the standard
-   Android `CALL`/`ENDCALL`/`SEARCH` codes.
-2. **ISteeringMenuService callback** (keyTypes 8/9/10). Depends on the bind above.
-3. **ModeMgr SWKey callback** (`registerModeMgrSWKeyEventCallback` →
-   `rcvStrgKeyEvent(keyCode, extra)`). The most promising: ModeMgrManager comes from
-   `getSystemService`, the same channel where audio focus already works, with no bind to
-   fail. The callback field existed since the fork and was never registered anywhere.
-   The extras distinguish OFFHOOK (1/2/7), ONHOOK (3/4/5) and TALK/SIRI (6/8/9); every
-   event is logged raw precisely because the keyCode/extra semantics are undocumented.
-
-## Toggle and dedupe
-
-The HR-V wheel has a single phone button, so accept and hang up share it. The app tracks
-call state through the dongle's `PhonecallStart`/`PhonecallStop` AudioCommands and toggles
-`ACCEPT_PHONE`/`REJECT_PHONE` accordingly.
-
-Because one physical press may arrive through more than one route, phone and talk actions
-are deduplicated with a 600 ms window. A duplicated ACCEPT is not harmless: the second one
-toggles into REJECT and hangs up the call being answered.
-
-## What the log will say tomorrow
-
-Pressing the phone/talk buttons with the app in the foreground produces one of:
+The resolution is unambiguous and needs no permission:
 
 ```
-"  -> phone button"/"talk button (keyEvent ...)"   the KeyEvent route works; done
-"rcvStrgKeyEvent keyCode=... extra=..."            the ModeMgr route delivers; check mapping
-"  keyCode <N> UNMAPPED"                           arrives with an unexpected code; map it
-nothing at all                                     the head unit intercepts the buttons and
-                                                   they cannot work while it does
+action resolves to 1 service(s)
+com.fujitsu_ten.displayaudio.steeringmenuservice/....service.SteeringMenuService   perm=null
+bindService(...) returned true
 ```
 
-# Reverse gear: layered defence (implemented Aug 9, 2026)
+**Lesson: never conclude a failure from a synchronous flag read before an asynchronous
+callback.** The package scan written to work around the phantom problem was removed; the
+resolution logging stayed, since it costs one line and detects a firmware change.
 
-The reported behaviour: engage reverse, and when leaving reverse the app is dead. Four
-foreground deaths on Aug 6 fit it. The suspected mechanism is the native OMX decoder writing
-into a Surface the head unit reclaimed by hardware for the camera, a SIGSEGV that no Java
-handler catches. Since the cause is not yet proven, the defence has three independent layers,
-and the instrumentation stays in place to identify which one fires.
+## The head unit intercepts the phone and TALK buttons
 
-## Layer 1: pause the decoder when the head unit takes the screen
+The TALK button arrives as a `KeyEvent` with the framework code, and the app handles it
+correctly. The command even reaches the phone:
 
-The StateMgr callback (the proven channel that already delivers day/night) reports
-`parkingSensor` and `videoAddress` changes. When the parking sensor arms or the video address
-moves away from ours (`getModeMgrOnVideoAddr`), the session stops feeding the native decoder.
-Audio keeps playing, matching what native sources do during a reverse manoeuvre.
+```
+08:58:43.291  talk button (keyEvent -65526) sent      <- SIRI sent to the dongle
+08:58:43.346  onUserLeaveHint — user left the app     <- the head unit takes the screen
+08:58:43.396  microphone: EcNc session started        <- the phone ASKED for the mic
+```
 
-When the signal clears, resume reuses the return-from-background sequence: recreate the
-decoder, reinject the cached SPS/PPS, request a keyframe. All idempotent: a false trigger
-costs one keyframe. A false negative is exactly the old behaviour, so the layer cannot make
-anything worse. The exact field semantics are undocumented; every raw value is logged
-(`head unit state: parkingSensor=... videoAddress=...`) so the car test refines the mapping.
+That third line is the proof the command worked: 105 ms after sending, the dongle requested
+the microphone, which is what a voice assistant does. But the head unit switches to its own
+screen in parallel, so the projection is gone.
 
-## Layer 2: relaunch after a kill
+There is no hook to refuse it. `onFinishView`, which returns a boolean and could deny the
+transition, is **never called**. The unit does not ask, it switches.
 
-The service was already START_STICKY, but its restart did nothing: the process came back
-headless and the driver found a dead app. Now a restart with a null intent (which only
-happens after a kill: user exits go through ACTION_STOP and return START_NOT_STICKY)
-relaunches the Activity after 5s.
+`rcvStrgKeyEvent` (the ModeMgr route) never fired either, so the head unit does not deliver
+these keys to apps through any of the three routes; it consumes them.
 
-The "user left on purpose" flag is persisted in SharedPreferences, because the in-memory
-flag dies with the process and the decision is made precisely after a process death.
-Without it, a memory kill hours after the user switched to FM would pop the app over the
-radio screen.
+**Status: not solvable from inside the app with the interfaces known today.** The buttons work,
+in the sense that the command reaches the phone, but the screen is lost in the same gesture.
 
-## Layer 3: diagnosis continues
+## Reverse gear: the signal is focus, not the vehicle state
 
-The 5s heartbeat, onTrimMemory/onLowMemory/onSaveInstanceState and the focus logging from
-the previous build remain. If layer 1 works, the log shows the pause/resume pair and no
-death. If the death still happens, the log now also shows whether the state signals fired
-before it, which pins down the ordering. If layer 2 fires, its line is unmistakable.
+The vehicle route does not exist on this head unit. Zero `head unit state` lines across four
+sessions, while `dayNightState` arrived 10 times in the same logs: the StateMgr callback is
+alive and the unit simply never publishes `parkingSensor` or `videoAddress`.
+
+What reverse gear does produce is exactly one Java event:
+
+```
+09:02:17.482  alive | dongle sending=true phone=false
+09:02:18.435  focus lost
+(log ends, process dead)
+```
+
+No `onPause`, `onStop`, `onTrimMemory` or `onSaveInstanceState`. Compare with the TALK button
+on the same day, which produced `onUserLeaveHint`, `onPause`, `focus lost`, `surfaceDestroyed`
+and `onStop` in order. **Two different mechanisms**: the TALK path is an ordinary Android screen
+change; reverse gear puts a window on top WITHOUT pausing the Activity, which is why `onPause`
+never arrives and why anything hooked to it cannot help.
+
+The absence of `onTrimMemory` also rules out the lowmemorykiller, leaving the native decoder
+writing into a reclaimed Surface as the standing hypothesis.
+
+The defence now hangs off `onWindowFocusChanged`: losing focus pauses the native decoder, and
+regaining it recreates the decoder, reinjects the cached SPS/PPS and requests a keyframe. It is
+deliberately not filtered by "was it really reverse": any window on top means feeding the
+decoder buys nothing, and a false positive costs one keyframe.
+
+Layer 2 (relaunch after a kill) did not fire: no `service restarted` line. Either the head unit
+kills the process in a way that defeats START_STICKY, or the service died without Android
+restarting it. Still open.
+
+## Calls: audio arrives, the voice does not leave
+
+With the phone unpaired from the car, the call did stay inside Android Auto, which confirms the
+routing conclusion from AUDIO-STREAM.md. The far end was audible; the local voice never got
+there.
+
+The logs showed `EcNc session started` three times and nothing else, because every message in
+`CarlinkitMicrophone` went to `Log.i` (logcat), which this head unit does not expose. Opening
+the microphone successfully says nothing about whether the samples carry sound.
+
+The class now logs to the file, and reports **amplitude**, which is what separates the possible
+causes:
+
+```
+peak 0            digital zero: the head unit did not route the mic to the app
+peak below ~150   noise floor only, nothing usable for the far end
+peak 2000+        real speech, so the problem is downstream (protocol/dongle)
+```
+
+The chunk counter, the accepted `AudioSource` (VOICE_RECOGNITION or the MIC fallback), the
+`sendMicAudio` failures and a one-line verdict at the end of the capture are logged too.
+
+## The dongle limit that forced a physical removal
+
+```
+08:58:56.208  dongle disconnected
+08:58:56.254  dongle is restarting — searching again in 8s (attempt 1/1)
+08:59:04.260  dongle found
+08:59:07.401  dongle disconnected
+08:59:07.422  dongle dropped again after 1 reconnection — not retrying
+08:59:18.900  dongle dropped again after 1 reconnection — not retrying
+```
+
+The app gave up by its own rule, not because the hardware was unrecoverable, and unplugging
+the dongle was the only way back. `MAX_DONGLE_RECONNECT_ATTEMPTS` was 1.
+
+The limit exists to stop a reconnection cascade, and a cascade is many attempts in a few
+seconds, not a few spread over a trip. It is now 5 attempts inside a 120 s sliding window:
+attempts older than the window do not count, so an occasional hiccup is recovered indefinitely
+while a real loop still reaches the ceiling and shows the power cycle message.
+
+## Bug found in our own instrumentation
+
+`registerModeMgrSWKeyEventCallback` returns the **index**, not zero, on success:
+
+```
+registerModeMgrSWKeyEventCallback(idx=213) ret=213
+```
+
+The first version treated `ret != 0` as refusal and discarded the callback, so every
+`initAudioBinding` registered it again: 15 registrations across four sessions, all successful
+and all thrown away. Now `ret == idx` counts as success.
