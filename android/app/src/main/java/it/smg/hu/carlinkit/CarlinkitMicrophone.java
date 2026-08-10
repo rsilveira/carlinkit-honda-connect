@@ -4,6 +4,7 @@ import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
 
+import it.smg.libs.carlinkit.AudioMessage;
 import it.smg.libs.carlinkit.CarlinkitDriver;
 
 /**
@@ -25,10 +26,20 @@ public final class CarlinkitMicrophone {
 
     private static final String TAG = "CarlinkitMic";
 
-    /** decodeType 5 = 16000 Hz, 1 channel. */
-    private static final int SAMPLE_RATE = 16000;
-    /** How many samples to send per message: 20 ms of audio. */
-    private static final int CHUNK_SAMPLES = SAMPLE_RATE / 50;
+    /**
+     * Capture format, chosen by the dongle rather than fixed by us.
+     *
+     * It used to be hardcoded to decodeType 5 (16000 Hz mono). On 10/Aug that produced a call
+     * where the microphone captured real speech (peak 2986, zero silent chunks, 1.3 MB sent
+     * with no send failures) and the far end still heard nothing, which points at the format
+     * rather than the capture. The protocol carries the answer in the InputConfig audio
+     * command, whose decodeType announces the format the phone wants; the app used to parse
+     * that command and discard it.
+     */
+    private int decodeType = 5;
+    private int sampleRate = 16000;
+    /** How many samples to send per message: 20 ms of audio at the current rate. */
+    private int chunkSamples = 16000 / 50;
 
     /**
      * Audio sources to try, in order.
@@ -96,6 +107,34 @@ public final class CarlinkitMicrophone {
 
     public CarlinkitMicrophone(CarlinkitDriver driver) {
         this.driver = driver;
+    }
+
+    /**
+     * Sets the capture format from a protocol decodeType. Ignored while capturing, since the
+     * AudioRecord would have to be recreated; the next start() picks it up.
+     *
+     * @return true if the format is known and was accepted
+     */
+    public synchronized boolean setDecodeType(int type) {
+        AudioMessage.Format f = AudioMessage.formatOf(type);
+        if (f == null || f.channels != 1) {
+            // Only mono formats make sense for a microphone, and an unknown type would break
+            // the AudioRecord constructor.
+            CarlinkitFileLog.log(TAG, "mic: ignoring unusable capture decodeType " + type);
+            return false;
+        }
+        if (running) {
+            CarlinkitFileLog.log(TAG, "mic: decodeType " + type
+                    + " will apply on the next capture (one is running)");
+            this.decodeType = type;
+            return true;
+        }
+        this.decodeType = type;
+        this.sampleRate = f.sampleRate;
+        this.chunkSamples = f.sampleRate / 50;
+        CarlinkitFileLog.log(TAG, "mic: capture format set to decodeType " + type
+                + " (" + f.sampleRate + "Hz mono)");
+        return true;
     }
 
     public synchronized boolean isRunning() {
@@ -178,7 +217,7 @@ public final class CarlinkitMicrophone {
             return false;
         }
         CarlinkitFileLog.log(TAG, "mic: capture started, source=" + sourceName
-                + " " + SAMPLE_RATE + "Hz mono buffer=" + bufSize + "B");
+                + " " + sampleRate + "Hz mono (decodeType " + decodeType + ") buffer=" + bufSize + "B");
         return true;
     }
 
@@ -188,17 +227,17 @@ public final class CarlinkitMicrophone {
      * @return true if the device initialized and moved to RECORDING
      */
     private boolean openSource(int source) {
-        int minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE,
+        int minBuf = AudioRecord.getMinBufferSize(sampleRate,
                 AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT);
         if (minBuf <= 0) {
             CarlinkitFileLog.log(TAG, "mic: invalid getMinBufferSize: " + minBuf);
             return false;
         }
         // Generous buffer: the head unit has a modest CPU and an overrun loses part of the phrase
-        bufSize = Math.max(minBuf * 4, CHUNK_SAMPLES * 2 * 8);
+        bufSize = Math.max(minBuf * 4, chunkSamples * 2 * 8);
         try {
             releaseRecord();
-            record = new AudioRecord(source, SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO,
+            record = new AudioRecord(source, sampleRate, AudioFormat.CHANNEL_IN_MONO,
                     AudioFormat.ENCODING_PCM_16BIT, bufSize);
             if (record.getState() != AudioRecord.STATE_INITIALIZED) {
                 CarlinkitFileLog.log(TAG, "mic: " + sourceLabel(source) + " did not initialize");
@@ -291,7 +330,7 @@ public final class CarlinkitMicrophone {
     }
 
     private void captureLoop() {
-        byte[] buf = new byte[CHUNK_SAMPLES * 2];
+        byte[] buf = new byte[chunkSamples * 2];
         long sendFailures = 0;
         try {
             while (running) {
@@ -342,7 +381,7 @@ public final class CarlinkitMicrophone {
                 if (chunks <= 3 || chunks % 50 == 0) {
                     logAmplitude(buf, n, peak);
                 }
-                if (!driver.sendMicAudio(buf, n)) {
+                if (!driver.sendMicAudio(buf, n, decodeType)) {
                     // A send failure usually means the dongle is restarting; it is not worth
                     // stopping the capture for that, the driver reopens the device.
                     sendFailures++;

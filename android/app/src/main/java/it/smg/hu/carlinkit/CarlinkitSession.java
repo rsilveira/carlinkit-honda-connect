@@ -78,6 +78,11 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
      * wheel has a single phone button, so accept and reject must share it.
      */
     private volatile boolean phoneCallActive;
+    /**
+     * True once the dongle has told us which capture format to use. Until then the format is a
+     * guess, and the log says so; after it, the announced value always wins.
+     */
+    private volatile boolean inputConfigSeen;
 
     public CarlinkitSession(int fps) {
         this.video = new CarlinkitVideoRenderer(fps);
@@ -191,40 +196,45 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
     }
 
     /**
-     * True while the head unit has the screen (reverse camera). Feeding the native decoder
-     * in that window is the prime suspect for the foreground deaths: OMX writing into a
-     * Surface that was reclaimed by hardware, a SIGSEGV no Java handler catches.
+     * True while the head unit has the screen (reverse camera). Frames that arrive in this
+     * window are dropped instead of being decoded into a surface we no longer own.
      */
     private volatile boolean screenTakenByHeadUnit;
 
     /**
-     * Called when the head unit takes the screen for itself (reverse camera) and when it
-     * hands it back. Only the video pauses; audio keeps playing, matching what the native
-     * sources do during a reverse manoeuvre.
+     * Called when the head unit takes the screen for itself (reverse camera) and when it hands
+     * it back.
      *
-     * Resuming reuses the same sequence as returning from background: recreate the decoder,
-     * reinject the cached SPS/PPS (the dongle never resends them) and request a keyframe.
-     * All idempotent, so a false trigger costs one keyframe.
+     * ⚠️ This deliberately does NOT stop the decoder, which is the lesson from 10/Aug. The
+     * first version called video.stop(), and that runs codec.shutdown() and therefore
+     * nativeDelete() on the OMX decoder. The log ends 92 ms after that call:
+     *
+     *     12:38:47.010  focus lost
+     *     12:38:47.102  focus lost -> video decoder paused (protection)
+     *     (log ends, process dead)
+     *
+     * Tearing down a native decoder whose output surface was just reclaimed is at best useless
+     * here and at worst the trigger itself, and a SIGSEGV in C++ never reaches a Java handler.
+     *
+     * Not feeding it achieves the same protection for free: frames keep arriving and are dropped
+     * in onVideoFrame, the decoder stays allocated and valid, and coming back needs no
+     * recreation, no SPS/PPS reinjection and no keyframe, just a flag flip. This works because
+     * reverse gear does not destroy the Surface; a genuine surfaceDestroyed still goes through
+     * onSurfaceDestroyed, which stops the decoder properly.
      */
     public void onScreenTakenByHeadUnit(boolean taken) {
         screenTakenByHeadUnit = taken;
         if (taken) {
-            video.stop();
-            Log.i(TAG, "video decoder paused: head unit took the screen");
-        } else if (surfaceReady) {
-            if (!video.start()) {
-                Log.w(TAG, "video decoder did not restart after the screen came back");
-                return;
-            }
-            if (driver != null) {
-                byte[] params = driver.parameterSetCache().parameterSets();
-                if (params != null) {
-                    video.reinjectParameterSets(params);
-                }
-                driver.requestKeyFrame();
-            }
-            Log.i(TAG, "video decoder resumed: screen handed back");
+            Log.i(TAG, "video: head unit took the screen, dropping frames"
+                    + " (decoder intentionally left alive)");
+            return;
         }
+        // Back on screen: ask for a keyframe so the picture recovers at once instead of waiting
+        // for the next natural one, but only if the decoder really is still there.
+        if (surfaceReady && video.isRunning() && driver != null) {
+            driver.requestKeyFrame();
+        }
+        Log.i(TAG, "video: screen handed back, resuming frames");
     }
 
     /** Forwards a SurfaceView touch to the phone. */
@@ -322,22 +332,49 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
         receivedData = true;
         audio.onAudio(msg, payload);
         if (msg != null && msg.kind == AudioMessage.KIND_COMMAND) {
-            handleMicCommand(msg.command);
+            handleMicCommand(msg.command, msg.decodeType);
         }
     }
 
     /**
-     * The phone signals the start/end of microphone use through the AudioCommands.
-     * SiriStart/PhonecallStart ask for capture; the matching Stop commands end it.
-     * InputConfig merely announces the input format.
+     * The phone signals microphone use through the AudioCommands, and announces the format it
+     * wants through InputConfig.
+     *
+     * ⚠️ InputConfig used to be discarded here, with a comment calling it a mere announcement.
+     * It is the opposite of that: it is the only place the phone states which format the
+     * capture must use, and ignoring it meant always sending decodeType 5 (16000 Hz). On
+     * 10/Aug that produced a call where the capture was demonstrably healthy (peak 2986, zero
+     * silent chunks, 1.3 MB sent, no send failures) and the far end still heard silence.
      */
-    private void handleMicCommand(int command) {
+    private void handleMicCommand(int command, int decodeType) {
         switch (command) {
+            case AudioMessage.Command.INPUT_CONFIG:
+                CarlinkitFileLog.log(TAG, "InputConfig: the phone asks for capture decodeType "
+                        + decodeType);
+                if (mic != null) {
+                    mic.setDecodeType(decodeType);
+                    inputConfigSeen = true;
+                }
+                break;
             case AudioMessage.Command.PHONECALL_START:
                 phoneCallActive = true;
+                if (!inputConfigSeen && mic != null) {
+                    // No InputConfig arrived, so the format has to be guessed. Calls get
+                    // decodeType 3 (8000 Hz mono), the telephony format of this protocol,
+                    // because 16000 Hz is what failed in the car twice with a healthy capture.
+                    // A real InputConfig always wins over this, and the log says which applied.
+                    CarlinkitFileLog.log(TAG, "no InputConfig so far, assuming decodeType 3"
+                            + " (8000Hz) for the call");
+                    mic.setDecodeType(3);
+                }
                 startMic(command);
                 break;
             case AudioMessage.Command.SIRI_START:
+                if (!inputConfigSeen && mic != null) {
+                    // The assistant works at 16000 Hz: on 10/Aug the wake word and the command
+                    // were both understood with this format.
+                    mic.setDecodeType(5);
+                }
                 startMic(command);
                 break;
             case AudioMessage.Command.PHONECALL_STOP:
@@ -354,6 +391,10 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
                 stopMic();
                 break;
             default:
+                // Logged because the command set was mapped from captures, not documentation:
+                // an unexpected value here is a protocol detail we do not know about yet.
+                CarlinkitFileLog.log(TAG, "audio command " + AudioMessage.Command.name(command)
+                        + " (" + command + ") decodeType=" + decodeType + ", not handled");
                 break;
         }
     }

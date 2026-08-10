@@ -501,13 +501,14 @@ public final class CarlinkitDriver {
      * @param pcm buffer holding 16-bit little-endian PCM samples
      * @param len valid bytes in {@code pcm}
      */
-    public boolean sendMicAudio(byte[] pcm, int len) {
+    public boolean sendMicAudio(byte[] pcm, int len, int decodeType) {
         if (len <= 0) {
             return false;
         }
         byte[] payload = new byte[AudioMessage.HEADER_SIZE + len];
-        // decodeType = 5 -> 16000 Hz, 1 channel
-        payload[0] = 5;
+        // The format is whatever the phone asked for through InputConfig, not a constant:
+        // sending 16000 Hz to a call that expects 8000 makes the far end hear nothing.
+        payload[0] = (byte) decodeType;
         // volume float 0.0f and audioType = 3 (input); bytes 4..7 stay zeroed
         payload[8] = 3;
         System.arraycopy(pcm, 0, payload, AudioMessage.HEADER_SIZE, len);

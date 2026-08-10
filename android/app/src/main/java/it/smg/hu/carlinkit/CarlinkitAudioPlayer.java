@@ -120,7 +120,11 @@ public final class CarlinkitAudioPlayer {
             }
             track.play();
             currentDecodeType = decodeType;
-            Log.i(TAG, "AudioTrack created: " + f + " (buffer " + bufSize + "B)");
+            // In the file log too: the format the dongle SENDS is the best available clue to
+            // the format it EXPECTS back from the microphone. During a call, if this line
+            // reports 8000Hz, sending 16000Hz upstream is very likely why the far end hears
+            // nothing, and the head unit exposes no logcat to check it any other way.
+            CarlinkitFileLog.log(TAG, "audio out: decodeType=" + decodeType + " -> " + f);
             return true;
         } catch (Throwable t) {
             Log.e(TAG, "failed to create the AudioTrack for " + f, t);

@@ -524,16 +524,18 @@ public final class CarlinkitActivity extends Activity
         CarlinkitFileLog.log(TAG, "focus " + (hasFocus ? "gained" : "lost"));
         CarlinkitSession sess = session();
         if (!hasFocus) {
-            // Pause the native decoder. It is the prime suspect for the death: OMX writing
-            // into a Surface the head unit reclaimed for the camera, a SIGSEGV in C++ that no
-            // Java handler catches. Audio keeps playing, as the native sources do in reverse.
+            // Stop feeding the native decoder: it would be writing into a Surface the head
+            // unit reclaimed for the camera. Audio keeps playing, as the native sources do in
+            // reverse. The decoder is NOT destroyed; see onScreenTakenByHeadUnit for why the
+            // first version did and what the log showed.
             //
             // Deliberately NOT filtered by "was it really reverse gear": any loss of focus
             // means something is on top of us, and feeding the decoder in that state buys
             // nothing. The cost of a false positive is one keyframe on the way back.
             if (sess != null) {
                 sess.onScreenTakenByHeadUnit(true);
-                CarlinkitFileLog.log(TAG, "focus lost -> video decoder paused (protection)");
+                CarlinkitFileLog.log(TAG, "focus lost -> dropping video frames"
+                        + " (decoder kept alive)");
             }
             return;
         }
