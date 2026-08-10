@@ -72,6 +72,12 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
     private volatile boolean receivedData;
     /** Last day/night state reported by the head unit, applied once the session is ready. */
     private Boolean pendingNightMode;
+    /**
+     * True between PhonecallStart and PhonecallStop. Lets the PICKUP steering wheel button
+     * toggle: accept when idle (a call is ringing), hang up when a call is active. The HR-V
+     * wheel has a single phone button, so accept and reject must share it.
+     */
+    private volatile boolean phoneCallActive;
 
     public CarlinkitSession(int fps) {
         this.video = new CarlinkitVideoRenderer(fps);
@@ -286,17 +292,28 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
      */
     private void handleMicCommand(int command) {
         switch (command) {
-            case AudioMessage.Command.SIRI_START:
             case AudioMessage.Command.PHONECALL_START:
+                phoneCallActive = true;
                 startMic(command);
                 break;
-            case AudioMessage.Command.SIRI_STOP:
+            case AudioMessage.Command.SIRI_START:
+                startMic(command);
+                break;
             case AudioMessage.Command.PHONECALL_STOP:
+                phoneCallActive = false;
+                stopMic();
+                break;
+            case AudioMessage.Command.SIRI_STOP:
                 stopMic();
                 break;
             default:
                 break;
         }
+    }
+
+    /** @return true while a phone call is in progress (between PhonecallStart and Stop) */
+    public boolean isPhoneCallActive() {
+        return phoneCallActive;
     }
 
     private void startMic(int command) {

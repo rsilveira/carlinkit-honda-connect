@@ -187,7 +187,8 @@ public class HondaConnectManager {
             @Override
             public void onServiceConnected(ComponentName name, IBinder service) {
                 try {
-                    if (Log.isVerbose()) Log.v(TAG, "Honda Wheel Service connected");
+                    CarlinkitFileLog.log(TAG, "wheel service CONNECTED: "
+                            + (name == null ? "?" : name.flattenToShortString()));
                     boundToSteeringMenuService_ = true;
                     steeringMenuServiceIface_ = ISteeringMenuService.Stub.asInterface(service);
 
@@ -638,12 +639,91 @@ public class HondaConnectManager {
         }
     }
 
+    /**
+     * Binds to the steering wheel service. This bind NEVER succeeded in any logged session
+     * (wheelServiceBound=false in 7 of 7 on Aug 6), and the original code ignored the boolean
+     * that bindService returns, so it failed without leaving a trace.
+     *
+     * The likely cause is intent resolution: the bind uses an implicit intent whose action is
+     * the interface name, which only works if some system service declares that action in an
+     * intent-filter. This version logs the resolution, and when the implicit intent matches
+     * nothing it searches the installed packages for a service whose name contains
+     * "SteeringMenu" and retries with an explicit component. Every step goes to the file log,
+     * so the car test tells us which case we are in.
+     */
     private void bindToWheelService(){
-        if (!boundToSteeringMenuService_) {
-            if (Log.isDebug()) Log.d(TAG, "Request binding to service " + ISteeringMenuService.class.getName());
-            Intent intent = new Intent(ISteeringMenuService.class.getName());
-            context_.bindService(intent, steeringMenuServiceConnection_, Context.BIND_AUTO_CREATE);
+        if (boundToSteeringMenuService_) {
+            return;
         }
+        String action = ISteeringMenuService.class.getName();
+        Intent intent = new Intent(action);
+
+        // Diagnostic: what does the implicit intent resolve to?
+        try {
+            android.content.pm.PackageManager pm = context_.getPackageManager();
+            java.util.List<android.content.pm.ResolveInfo> matches =
+                    pm.queryIntentServices(intent, 0);
+            CarlinkitFileLog.log(TAG, "wheel service: action resolves to "
+                    + (matches == null ? 0 : matches.size()) + " service(s)");
+            if (matches != null && !matches.isEmpty()) {
+                android.content.pm.ServiceInfo si = matches.get(0).serviceInfo;
+                CarlinkitFileLog.log(TAG, "wheel service: match " + si.packageName
+                        + "/" + si.name + " perm=" + si.permission);
+                // Explicit component avoids ambiguity when more than one matches
+                intent.setClassName(si.packageName, si.name);
+            } else {
+                ComponentName found = findSteeringServiceComponent(pm);
+                if (found != null) {
+                    CarlinkitFileLog.log(TAG, "wheel service: found by scan "
+                            + found.flattenToShortString() + ", binding explicitly");
+                    intent = new Intent(action);
+                    intent.setComponent(found);
+                }
+            }
+        } catch (Throwable t) {
+            CarlinkitFileLog.log(TAG, "wheel service: resolution query failed", t);
+        }
+
+        try {
+            boolean requested = context_.bindService(
+                    intent, steeringMenuServiceConnection_, Context.BIND_AUTO_CREATE);
+            CarlinkitFileLog.log(TAG, "wheel service: bindService("
+                    + (intent.getComponent() == null
+                        ? "implicit" : intent.getComponent().flattenToShortString())
+                    + ") returned " + requested);
+        } catch (Throwable t) {
+            // A SecurityException here means the service exists but requires a permission
+            // we do not hold; that is a different fix (whitelist/permission), so log it apart
+            CarlinkitFileLog.log(TAG, "wheel service: bindService threw", t);
+        }
+    }
+
+    /**
+     * Scans installed packages for a service whose class name contains "SteeringMenu".
+     * One-shot diagnostic for the head unit, where we cannot run adb: it discovers the real
+     * component name of the wheel service, whatever package Fujitsu Ten put it in.
+     */
+    private ComponentName findSteeringServiceComponent(android.content.pm.PackageManager pm) {
+        try {
+            java.util.List<android.content.pm.PackageInfo> pkgs = pm.getInstalledPackages(
+                    android.content.pm.PackageManager.GET_SERVICES);
+            for (android.content.pm.PackageInfo p : pkgs) {
+                if (p.services == null) continue;
+                for (android.content.pm.ServiceInfo s : p.services) {
+                    if (s.name != null && s.name.toLowerCase().contains("steeringmenu")) {
+                        CarlinkitFileLog.log(TAG, "wheel service: candidate "
+                                + s.packageName + "/" + s.name
+                                + " exported=" + s.exported + " perm=" + s.permission);
+                        return new ComponentName(s.packageName, s.name);
+                    }
+                }
+            }
+            CarlinkitFileLog.log(TAG, "wheel service: no candidate in "
+                    + pkgs.size() + " packages");
+        } catch (Throwable t) {
+            CarlinkitFileLog.log(TAG, "wheel service: package scan failed", t);
+        }
+        return null;
     }
 
     private void unbindToWheelService(){
@@ -674,6 +754,16 @@ public class HondaConnectManager {
             Log.e(TAG, "Error in unregisterModeMgrCallback", t);
         }
 
+        if (modeMgrServiceSWKeyEventCallBack_ != null) {
+            try {
+                int ret = modeMgrManager_.unregisterModeMgrSWKeyEventCallback(idx);
+                if (Log.isVerbose()) Log.v(TAG, "unregisterModeMgrSWKeyEventCallback ret " + ret);
+            } catch (Throwable t) {
+                Log.e(TAG, "Error in unregisterModeMgrSWKeyEventCallback", t);
+            }
+            modeMgrServiceSWKeyEventCallBack_ = null;
+        }
+
         modeMgrServiceCallBack_ = null;
     }
 
@@ -689,8 +779,41 @@ public class HondaConnectManager {
             } catch (Throwable t) {
                 Log.e(TAG, "Error in registerModeMgrCallback", t);
             }
+            registerModeMgrSWKeyCallback(idx);
         } else {
             Log.w(TAG, "modeMgrManager_ null -> do nothing");
+        }
+    }
+
+    /**
+     * Registers the ModeMgr steering wheel key callback. This is the second, independent
+     * route for steering buttons, and unlike ISteeringMenuService it does not depend on a
+     * bindService that may fail: the ModeMgrManager comes from getSystemService, the same
+     * channel through which the audio focus already works on this head unit.
+     *
+     * The field for this callback existed in the project since the OpenDroidAuto fork but
+     * was never registered anywhere, so the route was silently dead. With the wheel service
+     * never binding on this head unit (wheelServiceBound=false in 7 of 7 logged sessions),
+     * this may be the only route that actually delivers PICKUP/TALK.
+     */
+    private void registerModeMgrSWKeyCallback(int idx) {
+        if (modeMgrServiceSWKeyEventCallBack_ != null) {
+            return;   // already registered
+        }
+        try {
+            modeMgrServiceSWKeyEventCallBack_ = new ModeMgrSWKeyEventCallBack();
+            int ret = modeMgrManager_.registerModeMgrSWKeyEventCallback(
+                    idx, modeMgrServiceSWKeyEventCallBack_);
+            CarlinkitFileLog.log(TAG, "registerModeMgrSWKeyEventCallback(idx=" + idx
+                    + ") ret=" + ret);
+            if (ret != 0) {
+                // Non-zero smells like refusal; leave it unregistered so the next
+                // initAudioBinding retries.
+                modeMgrServiceSWKeyEventCallBack_ = null;
+            }
+        } catch (Throwable t) {
+            modeMgrServiceSWKeyEventCallBack_ = null;
+            CarlinkitFileLog.log(TAG, "registerModeMgrSWKeyEventCallback failed", t);
         }
     }
 
@@ -925,6 +1048,74 @@ public class HondaConnectManager {
             } catch (Throwable t) {
                 // Nao deixar a instrumentacao derrubar o callback de estado.
                 Log.e(TAG, "failed to report vehicle state", t);
+            }
+        }
+    }
+
+    /**
+     * Steering wheel keys delivered through the ModeMgr channel.
+     *
+     * The framework constants describe two dimensions: the physical key
+     * ({@code KEYCODE_STRG_*}, base -65536) and a semantic extra ({@code EXTRA_STRG_KEY_*}:
+     * OFFHOOK=1/2/7 for answering, ONHOOK=3/4/5 for hanging up, TALK=6/9 and SIRI_START=8
+     * for the assistant). Which of the two carries the useful value on this head unit is
+     * unknown until it runs in the car, so both are mapped and every event is logged raw.
+     *
+     * The mapped result is delivered through the same {@code HondaListener.onSteeringWheelKey}
+     * used by the ISteeringMenuService callback, translated to the {@code HondaKey} codes the
+     * rest of the app already understands. Deduplication against the KeyEvent route happens
+     * downstream, in the Activity.
+     */
+    private class ModeMgrSWKeyEventCallBack extends IModeMgrServiceSWKeyEventCallBack.Stub {
+
+        private static final String TAG = "HondaConnectManager-SWKeyEvent";
+
+        @Override
+        public void rcvStrgKeyEvent(int keyCode, int extra) throws RemoteException {
+            // Raw log first: this line is the discovery instrument for tomorrow's test
+            CarlinkitFileLog.log(TAG, "rcvStrgKeyEvent keyCode=" + keyCode + " extra=" + extra);
+
+            int hondaKey = mapToHondaKey(keyCode, extra);
+            if (hondaKey == -1) {
+                return;   // volume and unmapped keys stay with the head unit
+            }
+            List<HondaListener> listenersCopy;
+            synchronized (listeners_) {
+                listenersCopy = new ArrayList<>(listeners_);
+            }
+            for (HondaListener l : listenersCopy) {
+                try {
+                    l.onSteeringWheelKey(hondaKey);
+                } catch (Throwable t) {
+                    Log.e(TAG, "Error in listener callback", t);
+                }
+            }
+        }
+
+        /** Translates ModeMgr keyCode/extra to the HondaKey codes of SteeringWheelMapper. */
+        private int mapToHondaKey(int keyCode, int extra) {
+            // The extra is more specific; trust it first
+            switch (extra) {
+                case 1: case 2: case 7:   // OFFHOOK, OFFHOOK_L, OFFHOOK_REDIAL
+                    return 8;             // HondaKey.PICK_UP
+                case 3: case 4: case 5:   // ONHOOK, ONHOOK_1SEC_L, ONHOOK_5SEC_L
+                    return 9;             // HondaKey.HANG_UP
+                case 6: case 8: case 9:   // TALK, SIRI_START, TALK_L
+                    return 10;            // HondaKey.TALK
+                default:
+                    break;
+            }
+            switch (keyCode) {
+                case -65528:              // KEYCODE_STRG_PICKUP
+                    return 8;
+                case -65526: case -65522: // KEYCODE_STRG_TALK, TALK_L
+                    return 10;
+                case -65533:              // KEYCODE_STRG_CH_UP
+                    return 3;             // HondaKey.TRACK_UP
+                case -65532:              // KEYCODE_STRG_CH_DOWN
+                    return 4;             // HondaKey.TRACK_DOWN
+                default:
+                    return -1;
             }
         }
     }

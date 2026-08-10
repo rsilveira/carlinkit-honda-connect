@@ -948,10 +948,82 @@ public final class CarlinkitActivity extends Activity
      */
     @Override
     public void onSteeringWheelKey(int keyType) {
+        // Phone and assistant get centralized handling (toggle + dedupe), because the same
+        // physical press may arrive through more than one route: KeyEvent, the wheel service
+        // callback and the ModeMgr SWKey callback. Track keys have no toggle, so a duplicate
+        // is harmless there and they keep the direct path.
+        switch (keyType) {
+            case 8:    // HondaKey.PICK_UP
+                phoneButton("service");
+                return;
+            case 9:    // HondaKey.HANG_UP
+                endCallButton("service");
+                return;
+            case 10:   // HondaKey.TALK
+                talkButton("service");
+                return;
+            default:
+                break;
+        }
         CarlinkitSession sess = session();
         boolean sent = sess != null && sess.onSteeringWheelKey(keyType);
         CarlinkitFileLog.log(TAG, "steering wheel keyType=" + keyType
                 + (sess == null ? " (session inactive)" : sent ? " sent" : " unmapped"));
+    }
+
+    /**
+     * The same physical button can reach the app through up to three routes (KeyEvent,
+     * ISteeringMenuService callback, ModeMgr SWKey callback), and we will only learn
+     * tomorrow which of them this head unit actually uses. For the phone button a duplicate
+     * is not harmless: the second ACCEPT toggles into REJECT and hangs up the call being
+     * answered. The window absorbs duplicates without eating deliberate repeated presses.
+     */
+    private static final long KEY_DEDUPE_MS = 600;
+    private long lastPhoneButtonAt;
+    private long lastTalkButtonAt;
+
+    private boolean dedupe(long now, long lastAt) {
+        return now - lastAt < KEY_DEDUPE_MS;
+    }
+
+    /** Single phone button: accept when idle, hang up during a call. */
+    private void phoneButton(String source) {
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (dedupe(now, lastPhoneButtonAt)) {
+            CarlinkitFileLog.log(TAG, "phone button (" + source + ") deduped");
+            return;
+        }
+        lastPhoneButtonAt = now;
+        CarlinkitSession sess = session();
+        boolean inCall = sess != null && sess.isPhoneCallActive();
+        int cmd = inCall ? CarlinkitProtocol.Command.REJECT_PHONE
+                : CarlinkitProtocol.Command.ACCEPT_PHONE;
+        boolean sent = sendToDongle(cmd);
+        CarlinkitFileLog.log(TAG, "phone button (" + source + "): "
+                + (inCall ? "hang up" : "accept") + (sent ? " sent" : " NOT sent"));
+    }
+
+    private void endCallButton(String source) {
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (dedupe(now, lastPhoneButtonAt)) {
+            CarlinkitFileLog.log(TAG, "end call (" + source + ") deduped");
+            return;
+        }
+        lastPhoneButtonAt = now;
+        boolean sent = sendToDongle(CarlinkitProtocol.Command.REJECT_PHONE);
+        CarlinkitFileLog.log(TAG, "end call (" + source + ")" + (sent ? " sent" : " NOT sent"));
+    }
+
+    /** Voice assistant: Google Assistant on Android Auto, Siri on CarPlay. */
+    private void talkButton(String source) {
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (dedupe(now, lastTalkButtonAt)) {
+            CarlinkitFileLog.log(TAG, "talk button (" + source + ") deduped");
+            return;
+        }
+        lastTalkButtonAt = now;
+        boolean sent = sendToDongle(CarlinkitProtocol.Command.SIRI);
+        CarlinkitFileLog.log(TAG, "talk button (" + source + ")" + (sent ? " sent" : " NOT sent"));
     }
 
     @Override
@@ -965,10 +1037,26 @@ public final class CarlinkitActivity extends Activity
     }
 
     /**
+     * Steering wheel keyCodes of the Fujitsu Ten framework
+     * ({@code ModeMgrManager.KEYCODE_STRG_*}, base -65536). The keymap defaults stored on
+     * this head unit match these values exactly (PLUS=-65535, MINUS=-65534, LEFT=-65532,
+     * RIGHT=-65533), which is the evidence that steering buttons arrive as ordinary
+     * KeyEvents here. Declared locally because ada-ext-api.jar is compileOnly and constants
+     * are inlined at compile time anyway.
+     */
+    private static final int KEYCODE_STRG_PICKUP = -65528;
+    private static final int KEYCODE_STRG_TALK = -65526;
+
+    /**
      * Steering wheel buttons that the head unit delivers as a KeyEvent (not through
-     * onSteeringWheelKey): volume and, on many units, track switching. The keyCodes are
-     * proprietary (negative) and configurable in the keymap, so every event is written to
-     * the log — that is how we discover the real codes of this head unit.
+     * onSteeringWheelKey): volume, track switching, and now the phone and voice assistant
+     * buttons. The keyCodes are proprietary (negative) and every unmapped event is written
+     * to the log; that is how we discover the real codes of this head unit.
+     *
+     * The phone/TALK handling is UNTESTED in the car. Whether the head unit delivers
+     * PICKUP/TALK to a foreground app, or intercepts them for its own telephony, is exactly
+     * what the log will answer: a handled line means delivered, an UNMAPPED line means the
+     * code differs, and no line at all means intercepted.
      */
     @Override
     public boolean dispatchKeyEvent(KeyEvent event) {
@@ -1012,6 +1100,15 @@ public final class CarlinkitActivity extends Activity
                     CarlinkitFileLog.log(TAG, "  -> previous track");
                     return true;
                 }
+            } else if (code == KEYCODE_STRG_PICKUP || code == KeyEvent.KEYCODE_CALL) {
+                phoneButton("keyEvent " + code);
+                return true;
+            } else if (code == KeyEvent.KEYCODE_ENDCALL) {
+                endCallButton("keyEvent " + code);
+                return true;
+            } else if (code == KEYCODE_STRG_TALK || code == KeyEvent.KEYCODE_SEARCH) {
+                talkButton("keyEvent " + code);
+                return true;
             }
         }
         if (action == KeyEvent.ACTION_DOWN && code != KeyEvent.KEYCODE_BACK) {

@@ -303,3 +303,68 @@ app never wrote anything. Check that the device is actually mounted before concl
 is missing.
 
 ---
+
+# Steering wheel: phone and assistant buttons (investigated Aug 9, 2026)
+
+Motivation: with the phone paired to the car over Bluetooth, calls are handled by the native
+telephony (see AUDIO-STREAM.md). Unpairing hands the call to Android Auto through the dongle,
+and then the wheel's phone/talk buttons only work if this app receives and forwards them.
+
+## The wheel service never binds
+
+`wheelServiceBound=false` in 7 of 7 logged sessions. The bind used an implicit intent whose
+action is the AIDL interface name (`...steeringmenuservice.service.ISteeringMenuService`) and
+ignored the boolean that `bindService` returns, so it failed silently since the fork. Nothing
+that works today depends on it: volume and track arrive as `KeyEvent`s.
+
+The bind now logs the intent resolution (`queryIntentServices`), scans the installed packages
+for a service class containing "SteeringMenu" when the action resolves to nothing, retries
+with an explicit component when it finds one, and logs what `bindService` returns. Whatever
+the car says tomorrow identifies the failure mode:
+
+```
+"action resolves to 0 service(s)" + no candidate   the service is not an Android service
+                                                    reachable by apps; forget this route
+"found by scan ... bindService(...) returned false" exists but refuses; probably permission
+"bindService threw SecurityException"               exists, needs a permission we lack
+"wheel service CONNECTED"                           it worked; keyTypes 8/9/10 flow in
+```
+
+## Three candidate routes, all instrumented
+
+The framework offers the buttons through up to three routes, and which one this head unit
+uses is unknown until it runs in the car. All three are now implemented and logged:
+
+1. **KeyEvent** (`dispatchKeyEvent`). Proven route: the keymap codes stored on the head unit
+   are exactly the framework constants (`KEYCODE_STRG_*`, base -65536), and volume/track
+   already work through it. Added: `PICKUP` (-65528), `TALK` (-65526), plus the standard
+   Android `CALL`/`ENDCALL`/`SEARCH` codes.
+2. **ISteeringMenuService callback** (keyTypes 8/9/10). Depends on the bind above.
+3. **ModeMgr SWKey callback** (`registerModeMgrSWKeyEventCallback` →
+   `rcvStrgKeyEvent(keyCode, extra)`). The most promising: ModeMgrManager comes from
+   `getSystemService`, the same channel where audio focus already works, with no bind to
+   fail. The callback field existed since the fork and was never registered anywhere.
+   The extras distinguish OFFHOOK (1/2/7), ONHOOK (3/4/5) and TALK/SIRI (6/8/9); every
+   event is logged raw precisely because the keyCode/extra semantics are undocumented.
+
+## Toggle and dedupe
+
+The HR-V wheel has a single phone button, so accept and hang up share it. The app tracks
+call state through the dongle's `PhonecallStart`/`PhonecallStop` AudioCommands and toggles
+`ACCEPT_PHONE`/`REJECT_PHONE` accordingly.
+
+Because one physical press may arrive through more than one route, phone and talk actions
+are deduplicated with a 600 ms window. A duplicated ACCEPT is not harmless: the second one
+toggles into REJECT and hangs up the call being answered.
+
+## What the log will say tomorrow
+
+Pressing the phone/talk buttons with the app in the foreground produces one of:
+
+```
+"  -> phone button"/"talk button (keyEvent ...)"   the KeyEvent route works; done
+"rcvStrgKeyEvent keyCode=... extra=..."            the ModeMgr route delivers; check mapping
+"  keyCode <N> UNMAPPED"                           arrives with an unexpected code; map it
+nothing at all                                     the head unit intercepts the buttons and
+                                                   they cannot work while it does
+```
