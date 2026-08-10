@@ -27,6 +27,17 @@ public final class CarlinkitAudioPlayer {
 
     private static final String TAG = "CarlinkitAudio";
 
+    /**
+     * One AudioTrack per decodeType, instead of one that gets recreated on every change.
+     *
+     * Measured on 10/Aug: during a call the dongle alternates decodeType 3 (8000 Hz, the voice)
+     * and 4 (48000 Hz, the media) message by message, dozens of times per second. Recreating
+     * the track each time meant a stop/release/new/play cycle at that rate, which is expensive
+     * on this SoC and drops the first samples after every switch. Keeping both alive costs two
+     * small buffers.
+     */
+    private final java.util.HashMap<Integer, AudioTrack> tracks =
+            new java.util.HashMap<Integer, AudioTrack>();
     private AudioTrack track;
     private int currentDecodeType = -1;
     private volatile boolean running;
@@ -45,15 +56,14 @@ public final class CarlinkitAudioPlayer {
      */
     public synchronized void setMuted(boolean value) {
         muted = value;
-        if (value && track != null) {
+        for (AudioTrack t : tracks.values()) {
             try {
-                track.pause();
-                track.flush();
-            } catch (Throwable ignored) {
-            }
-        } else if (!value && track != null) {
-            try {
-                track.play();
+                if (value) {
+                    t.pause();
+                    t.flush();
+                } else {
+                    t.play();
+                }
             } catch (Throwable ignored) {
             }
         }
@@ -66,17 +76,17 @@ public final class CarlinkitAudioPlayer {
     }
 
     private void releaseTrack() {
-        if (track == null) {
-            return;
-        }
-        try {
-            if (track.getPlayState() == AudioTrack.PLAYSTATE_PLAYING) {
-                track.stop();
+        for (AudioTrack t : tracks.values()) {
+            try {
+                if (t.getPlayState() == AudioTrack.PLAYSTATE_PLAYING) {
+                    t.stop();
+                }
+                t.release();
+            } catch (Throwable e) {
+                Log.e(TAG, "error releasing an AudioTrack", e);
             }
-            track.release();
-        } catch (Throwable t) {
-            Log.e(TAG, "error releasing the AudioTrack", t);
         }
+        tracks.clear();
         track = null;
         currentDecodeType = -1;
     }
@@ -90,12 +100,25 @@ public final class CarlinkitAudioPlayer {
         if (track != null && currentDecodeType == decodeType) {
             return true;
         }
+        // Reuse the track for this format if it already exists. This is the whole point of the
+        // map: switching format becomes a pointer swap instead of a stop/release/new/play cycle.
+        AudioTrack existing = tracks.get(Integer.valueOf(decodeType));
+        if (existing != null) {
+            track = existing;
+            currentDecodeType = decodeType;
+            if (!muted) {
+                try {
+                    track.play();
+                } catch (Throwable ignored) {
+                }
+            }
+            return true;
+        }
         AudioMessage.Format f = AudioMessage.formatOf(decodeType);
         if (f == null) {
             Log.e(TAG, "unknown decodeType: " + decodeType);
             return false;
         }
-        releaseTrack();
 
         int channelConfig = f.channels == 2
                 ? AudioFormat.CHANNEL_OUT_STEREO
@@ -111,24 +134,31 @@ public final class CarlinkitAudioPlayer {
         int bufSize = minBuf * 4;
 
         try {
-            track = new AudioTrack(AudioManager.STREAM_MUSIC, f.sampleRate, channelConfig,
-                    encoding, bufSize, AudioTrack.MODE_STREAM);
-            if (track.getState() != AudioTrack.STATE_INITIALIZED) {
+            AudioTrack fresh = new AudioTrack(AudioManager.STREAM_MUSIC, f.sampleRate,
+                    channelConfig, encoding, bufSize, AudioTrack.MODE_STREAM);
+            if (fresh.getState() != AudioTrack.STATE_INITIALIZED) {
                 Log.e(TAG, "AudioTrack did not initialize for " + f);
-                releaseTrack();
+                try {
+                    fresh.release();
+                } catch (Throwable ignored) {
+                }
                 return false;
             }
-            track.play();
+            if (!muted) {
+                fresh.play();
+            }
+            tracks.put(Integer.valueOf(decodeType), fresh);
+            track = fresh;
             currentDecodeType = decodeType;
             // In the file log too: the format the dongle SENDS is the best available clue to
-            // the format it EXPECTS back from the microphone. During a call, if this line
-            // reports 8000Hz, sending 16000Hz upstream is very likely why the far end hears
-            // nothing, and the head unit exposes no logcat to check it any other way.
+            // the format it EXPECTS back from the microphone. On 10/Aug this line reported
+            // 8000Hz during a call while the microphone was sending 16000Hz upstream, which is
+            // why the far end heard nothing. The head unit exposes no logcat to check it any
+            // other way. Logged once per format, not per switch.
             CarlinkitFileLog.log(TAG, "audio out: decodeType=" + decodeType + " -> " + f);
             return true;
         } catch (Throwable t) {
             Log.e(TAG, "failed to create the AudioTrack for " + f, t);
-            track = null;
             return false;
         }
     }

@@ -20,9 +20,27 @@ Every installed app needs an entry in the system whitelist, edited through the
 | **SoundOut** | **Exclusive** audio: opening the app terminates any other audio source. **This is what grants access to all speakers** |
 | **SoundInterrupt** | **Non-exclusive** audio: coexists with another source, but is **restricted to the LEFT speaker** (typical GPS behavior) |
 | **SoundInterruptMute** | Used together with `SoundInterrupt`: mutes the competing source on the left speaker |
-| **LastMode** | Prevents the app from closing when reverse gear is engaged or MENU is pressed; and reopens it at car start-up if it was the last one in the foreground |
-| **OomSetPerm** | Protection against the app being killed under memory pressure |
+| **LastMode** | Prevents the app from closing when reverse gear is engaged or MENU is pressed; and reopens it at car start-up if it was the last one in the foreground || **OomSetPerm** | Protection against the app being killed under memory pressure |
 | **ProcessKillTarget** | Marks the process as a kill target |
+
+### ⚠️ LastMode disabled is why the app dies in reverse gear (confirmed 10/Aug/2026)
+
+Three test sessions were spent chasing the app being killed when reverse gear engaged: the
+native decoder was suspected, then the vehicle state signals, then window focus. Instrumentation
+showed the process dying in the foreground with no `onPause`, sometimes with a bare `focus lost`
+and sometimes with no Java event at all, and pausing the decoder on that signal changed nothing.
+
+The cause was configuration, not code: **LastMode had been disabled** for this package in
+HondaPermissions. The parameter exists precisely to stop the head unit from closing an app when
+reverse gear or MENU takes the screen, and it is listed in the table above.
+
+Two lessons worth more than the fix:
+
+- When the head unit closes an app on purpose, it looks exactly like a crash from inside the
+  process. No lifecycle callback, no exception, no tombstone to find. Absence of evidence in the
+  app is itself evidence that the decision was taken outside it.
+- Check the whitelist entry before writing defensive code. `LastMode` and `OomSetPerm` decide
+  whether the process survives events the app cannot see, and neither is visible from the API.
 
 ### Recommended configuration for the Carlinkit app
 

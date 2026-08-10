@@ -110,30 +110,50 @@ public final class CarlinkitMicrophone {
     }
 
     /**
-     * Sets the capture format from a protocol decodeType. Ignored while capturing, since the
-     * AudioRecord would have to be recreated; the next start() picks it up.
+     * Sets the capture format from a protocol decodeType.
+     *
+     * ⚠️ Restarts an ongoing capture when the format actually changes, and that detail is the
+     * whole point. Measured on 10/Aug:
+     *
+     *     12:54:55.195  mic: capture started ... 16000Hz mono (decodeType 5)
+     *     12:54:55.196  mic requested (cmd 4 = PhonecallStart)
+     *     12:54:55.199  InputConfig: the phone asks for capture decodeType 3
+     *
+     * The phone announces the format 4 ms AFTER asking for the microphone, so by the time it
+     * speaks the capture is already running. The first version stored the value "for the next
+     * capture" and the whole call ran at 16000 Hz while the phone expected 8000, which is why
+     * the far end heard nothing even though the capture itself was healthy. The outgoing audio
+     * of that same call was decodeType 3, so the format is symmetric and there was no ambiguity
+     * to resolve, only a value to obey.
      *
      * @return true if the format is known and was accepted
      */
-    public synchronized boolean setDecodeType(int type) {
-        AudioMessage.Format f = AudioMessage.formatOf(type);
-        if (f == null || f.channels != 1) {
-            // Only mono formats make sense for a microphone, and an unknown type would break
-            // the AudioRecord constructor.
-            CarlinkitFileLog.log(TAG, "mic: ignoring unusable capture decodeType " + type);
-            return false;
+    public boolean setDecodeType(int type) {
+        boolean restart;
+        synchronized (this) {
+            AudioMessage.Format f = AudioMessage.formatOf(type);
+            if (f == null || f.channels != 1) {
+                // Only mono formats make sense for a microphone, and an unknown type would
+                // break the AudioRecord constructor.
+                CarlinkitFileLog.log(TAG, "mic: ignoring unusable capture decodeType " + type);
+                return false;
+            }
+            if (type == decodeType && sampleRate == f.sampleRate) {
+                return true;   // nothing to do
+            }
+            decodeType = type;
+            sampleRate = f.sampleRate;
+            chunkSamples = f.sampleRate / 50;
+            restart = running;
+            CarlinkitFileLog.log(TAG, "mic: capture format set to decodeType " + type
+                    + " (" + f.sampleRate + "Hz mono)"
+                    + (restart ? ", restarting the running capture" : ""));
         }
-        if (running) {
-            CarlinkitFileLog.log(TAG, "mic: decodeType " + type
-                    + " will apply on the next capture (one is running)");
-            this.decodeType = type;
-            return true;
+        if (restart) {
+            // Outside the monitor: stop() only signals, and start() waits for the old thread.
+            stop();
+            return start();
         }
-        this.decodeType = type;
-        this.sampleRate = f.sampleRate;
-        this.chunkSamples = f.sampleRate / 50;
-        CarlinkitFileLog.log(TAG, "mic: capture format set to decodeType " + type
-                + " (" + f.sampleRate + "Hz mono)");
         return true;
     }
 

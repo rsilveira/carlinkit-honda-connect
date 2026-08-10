@@ -27,23 +27,26 @@ Working in the car, verified on the target head unit:
 | Android Auto (Android phone) | working |
 | CarPlay (iPhone) | working |
 | Returning to FM radio and back | working |
-| Phone calls | audio arrives, **outgoing voice does not** (under investigation) |
+| Phone calls | incoming audio works; outgoing voice needs the format fix below |
 | Steering wheel: phone / assistant buttons | command reaches the phone, but the head unit takes the screen in the same press |
-| Reverse gear | **kills the app**; defence implemented, not yet validated |
+| Reverse gear | closes the app when **LastMode is disabled** in HondaPermissions |
 
 Measured in the car on 10/Aug and still open, with the evidence in
 [docs/FINDINGS.md](docs/FINDINGS.md):
 
-- **Calls have no outgoing voice.** With the phone unpaired from the car's Bluetooth the call
-  correctly stays inside Android Auto and the far end is audible, but the microphone capture
-  does not reach them. The capture now logs signal amplitude, which will separate "the head
-  unit never routed the mic to the app" from "audio was captured and lost downstream".
+- **Outgoing voice needed the announced format.** The capture was always healthy (peak 2884,
+  zero silent chunks, 1.3 MB delivered per call), but the microphone sent 16000 Hz while the
+  phone asked for 8000 Hz through the `InputConfig` audio command, which arrives 4 ms AFTER
+  `PhonecallStart`. The capture now restarts on that announcement instead of deferring it.
 - **The phone and TALK buttons cannot keep the screen.** The command does reach the phone, and
   the head unit switches to its own screen in the same gesture. It never calls `onFinishView`,
   so there is no hook to refuse the transition.
-- **Reverse gear.** The only Java event it produces is a bare `focus lost`, with no `onPause`
-  and no `onTrimMemory`, and the process dies right after. The decoder is now paused on focus
-  loss; whether that is enough is unverified.
+- **Reverse gear is a configuration issue.** The head unit closes the app on purpose when
+  `LastMode` is disabled for the package in HondaPermissions, which is exactly what that
+  parameter prevents. From inside the process this is indistinguishable from a crash: no
+  lifecycle callback, no exception, sometimes not even a focus change. Enable `LastMode` (and
+  `OomSetPerm`) before suspecting the code. See
+  [docs/HONDA-HEADUNIT.md](docs/HONDA-HEADUNIT.md).
 
 Known limitations are listed in [docs/FINDINGS.md](docs/FINDINGS.md).
 
