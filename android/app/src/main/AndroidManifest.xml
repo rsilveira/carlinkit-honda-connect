@@ -17,8 +17,10 @@
     <!-- DayNightSensor in TIME/GPS mode reads the location to work out sunrise/sunset -->
     <uses-feature android:name="android.hardware.location.gps" android:required="false"/>
 
-    <!-- Bluetooth: the Carlinkit protocol announces the HFP/A2DP configuration to the
-         phone (see Settings.Connectivity) -->
+    <!-- Bluetooth: the dongle pairs with the phone itself. These are declared because the
+         USB/Bluetooth stack on this head unit queries them during enumeration. Calls do not
+         go through this app: when the phone is paired to the car, the head unit answers them
+         with its own telephony over HFP (see docs/AUDIO-STREAM.md) -->
     <uses-permission android:name="android.permission.BLUETOOTH" android:required="false" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:required="false" />
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />

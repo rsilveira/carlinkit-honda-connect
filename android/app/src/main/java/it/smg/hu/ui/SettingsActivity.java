@@ -15,7 +15,6 @@ import it.smg.hu.config.Settings;
 import it.smg.hu.projection.InputDevice;
 import it.smg.hu.ui.settings.AdvancedFragment;
 import it.smg.hu.ui.settings.CarFragment;
-import it.smg.hu.ui.settings.ConnectivityFragment;
 import it.smg.hu.ui.settings.KeymapFragment;
 import it.smg.hu.ui.settings.VideoFragment;
 import it.smg.libs.common.Log;
@@ -95,11 +94,6 @@ public class SettingsActivity extends FragmentActivity implements InputDevice.On
         ImageButton keymapImage = findViewById(R.id.keymap_settings);
         keymapImage.setOnClickListener(
                 listener -> showFragment("keymap", new KeymapFragment())
-        );
-
-        ImageButton connImage = findViewById(R.id.conn_settings);
-        connImage.setOnClickListener(
-                listener -> showFragment("connectivity", new ConnectivityFragment())
         );
 
         showFragment("car (initial)", new CarFragment());

@@ -11,7 +11,6 @@
 	<!-- Bottom bar of SettingsActivity (contentDescription of each ImageButton) -->
 	<string name="main_settings">Main</string>
 	<string name="video_settings">Video Settings</string>
-	<string name="conn_settings">Connectivity Settings</string>
 	<string name="keymap_settings">KeyMap</string>
 	<string name="advanced_settings">Advanced</string>
 
@@ -37,10 +36,6 @@
 	<string name="video_show_media_notification">Show Media notification when app is in background</string>
 	<string name="video_show_navigation_notification">Show Navigation notification when app is in background</string>
 	<string name="video_show_app_badge">Show an application badge when app is in background</string>
-
-	<!-- ConnectivityFragment -->
-	<string name="conn_settings_enableAd2p">Enable AD2P</string>
-	<string name="conn_settings_enableHfp">Enable HFP</string>
 
 	<!-- KeymapFragment -->
 	<string name="keymap_steeringwheel_desc">Steering wheel</string>

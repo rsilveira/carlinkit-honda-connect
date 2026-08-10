@@ -25,7 +25,6 @@ public class Settings {
     public Advanced advanced;
     public Video video;
     public Audio audio;
-    public Connectivity connectivity;
 
     private static Settings settings = null;
 
@@ -42,7 +41,6 @@ public class Settings {
 
         car = new Car();
         keymap = new Keymap();
-        connectivity = new Connectivity();
         advanced = new Advanced();
         video = new Video();
         audio = new Audio();
@@ -303,30 +301,6 @@ public class Settings {
         }
     }
 
-    public class Connectivity extends Base {
-        public final static String CONN_ENABLED_AD2P = "audio_enable_ad2p";
-        public final static String CONN_ENABLED_HFP = "audio_enable_hfp";
-
-        public final static boolean CONN_ENABLED_AD2P_DEFAULT_VALUE = true;
-        public final static boolean CONN_ENABLED_HFP_DEFAULT_VALUE = true;
-
-
-        public boolean enableA2dp(){
-            return SP.getBoolean(CONN_ENABLED_AD2P, CONN_ENABLED_AD2P_DEFAULT_VALUE);
-        }
-        public void enableA2dp(boolean value){
-            SP.edit().putBoolean(CONN_ENABLED_AD2P, value).apply();
-        }
-
-        public boolean enableHfp(){
-            return SP.getBoolean(CONN_ENABLED_HFP, CONN_ENABLED_HFP_DEFAULT_VALUE);
-        }
-        public void enableHfp(boolean value){
-            SP.edit().putBoolean(CONN_ENABLED_HFP, value).apply();
-        }
-
-
-    }
     public class Audio extends Base {
         public final static String MEDIA_ENABLE_CHANNEL = "media_enable_channel";
         public final static String MEDIA_SAMPLERATE = "media_samplerate";
