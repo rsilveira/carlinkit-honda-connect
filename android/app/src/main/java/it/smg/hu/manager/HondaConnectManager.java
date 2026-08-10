@@ -311,17 +311,23 @@ public class HondaConnectManager {
             // (ex.: modo Carlinkit) consultem a propria entrada no HondaPermissions.
             pControl_ = IWhiteList.getProcessControl(context_.getPackageName(), null);
             if (pControl_ != null) {
-                Log.d(TAG, "ProcessControl [ ");
-                Log.d(TAG, "appType= " + pControl_.appType);
-                Log.d(TAG, "authType= " + pControl_.authType);
-                Log.d(TAG, "lastMode= " + pControl_.lastMode);
-                Log.d(TAG, "oomSetPerm= " + pControl_.oomSetPerm);
-                Log.d(TAG, "result= " + pControl_.result);
-                Log.d(TAG, "soundInterrupt= " + pControl_.soundInterrupt);
-                Log.d(TAG, "soundInterruptMute= " + pControl_.soundInterruptMute);
-                Log.d(TAG, "soundOut= " + pControl_.soundOut);
-                Log.d(TAG, "videoOut= " + pControl_.videoOut);
-                Log.d(TAG, "]");
+                // In the file log, on one line, because these values decide behaviour the app
+                // cannot see and cannot influence. lastMode disabled is what closed this app on
+                // reverse gear for three test sessions, and per the OpenDroidAuto maintainer
+                // authType below PREINSTALL is what gets an app killed during Bluetooth calls.
+                // The head unit exposes no adb, so without this line the whitelist entry has to
+                // be read from a settings screen and trusted from memory.
+                CarlinkitFileLog.log(TAG, "whitelist: authType=" + pControl_.authType
+                        + " appType=" + pControl_.appType
+                        + " lastMode=" + pControl_.lastMode
+                        + " oomSetPerm=" + pControl_.oomSetPerm
+                        + " soundOut=" + pControl_.soundOut
+                        + " videoOut=" + pControl_.videoOut
+                        + " soundInterrupt=" + pControl_.soundInterrupt
+                        + " result=" + pControl_.result);
+            } else {
+                CarlinkitFileLog.log(TAG, "whitelist: NO entry for "
+                        + context_.getPackageName() + " (privileges will be denied)");
             }
         } catch (Throwable t){
             Log.e(TAG, "process control error", t);
