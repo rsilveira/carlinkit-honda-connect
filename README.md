@@ -23,8 +23,8 @@ Working in the car, verified on the target head unit:
 | Audio out (PCM → `AudioTrack`, all speakers) | working |
 | Touch input | working |
 | Steering wheel: volume, next/previous track | working |
-| Microphone: voice assistant and phone calls | working |
-| Phone calls | working |
+| Microphone: voice assistant | working |
+| Phone calls | working, handled by the car's own telephony (see below) |
 | Day/night following the headlights | working |
 | Android Auto (Android phone) | working |
 | CarPlay (iPhone) | working |
@@ -34,9 +34,9 @@ Known limitations are listed in [docs/FINDINGS.md](docs/FINDINGS.md).
 
 ## What to expect in daily use
 
-The features above work, but two behaviours are visible every time you use it. Neither is a
-defect in this app — both come from the dongle and the head unit — and knowing about them
-saves a lot of confusion.
+The features above work, but three behaviours are visible every time you use it. None is a
+defect in this app. The first two come from the dongle and the head unit, the third is a
+consequence of how the car handles telephony, and knowing about them saves a lot of confusion.
 
 **A USB permission dialog appears on almost every launch.** The dongle re-enumerates on the
 USB bus constantly (its own watchdog reboots it roughly 9s after the host stops talking to
@@ -53,6 +53,20 @@ not hand it to apps.
 send nothing at all — the screen says the session started and no phone ever connects.
 Reopening the app does not help, because the dongle itself is wedged. Turn the car off and on.
 The app detects this state after 10s and says so on screen, rather than leaving you guessing.
+
+**A phone call takes over the screen, and you come back manually.** With the phone paired to
+the car over Bluetooth, an incoming or outgoing call is handled by the head unit's own phone
+app over HFP, exactly as it would be with no dongle plugged in. The Carlinkit screen is left
+behind and you have to switch back to the app when the call ends.
+
+This is a tradeoff rather than a fault. Call audio goes through Honda's telephony stack, with
+the echo cancellation the manufacturer tuned for this cabin, so the far end hears what it would
+hear normally. What you give up is the projected in call UI and the automatic return to
+projection afterwards. It also means the microphone capture in this app serves the **voice
+assistant only**: during a call the app never sees the audio.
+
+If you want calls to go through the dongle instead, unpair the phone from the car's Bluetooth.
+That has not been tested here, and it means giving up the native echo cancellation.
 
 ## Target hardware
 

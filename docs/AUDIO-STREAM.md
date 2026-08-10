@@ -118,6 +118,29 @@ Points to watch:
 3. `MediaStart`/`MediaStop` are good hooks for requesting and releasing audio focus on the head
    unit.
 
+## Phone calls do not reach this code path (observed in the car, Aug 9)
+
+The `PhonecallStart`/`PhonecallStop` commands and the 8 kHz mono format exist in the protocol,
+but with the phone paired to the car over Bluetooth they are not what happens in practice.
+
+Observed: when a call starts, the head unit switches away from the projection app to its own
+phone application and handles the call over HFP, the same way it does with no dongle connected.
+Returning to projection afterwards is manual. The app receives no call audio and its microphone
+capture is not involved.
+
+The practical consequences:
+
+- Call audio quality is the head unit's native telephony, including the manufacturer's echo
+  cancellation. There is nothing to implement or tune here, and nothing this app can break.
+- `CarlinkitMicrophone` therefore serves the **voice assistant** only.
+- The 8 kHz call format is presumably used by dongles running without a Bluetooth pairing
+  between phone and car. That configuration has not been tested here.
+
+An "Enable HFP" checkbox existed in the settings screen, inherited from OpenDroidAuto. Nothing
+in this project ever read it: the only audio related negotiation sent to the dongle is the
+`MIC` / `BOX_MIC` command choosing which microphone to use. The checkbox was removed rather than
+left in place suggesting control that does not exist.
+
 ## Tools
 
 - `tools/session.py` — **recommended daemon**: keeps the session alive, tolerates resets,
