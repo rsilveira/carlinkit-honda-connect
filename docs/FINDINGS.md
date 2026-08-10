@@ -368,3 +368,43 @@ Pressing the phone/talk buttons with the app in the foreground produces one of:
 nothing at all                                     the head unit intercepts the buttons and
                                                    they cannot work while it does
 ```
+
+# Reverse gear: layered defence (implemented Aug 9, 2026)
+
+The reported behaviour: engage reverse, and when leaving reverse the app is dead. Four
+foreground deaths on Aug 6 fit it. The suspected mechanism is the native OMX decoder writing
+into a Surface the head unit reclaimed by hardware for the camera, a SIGSEGV that no Java
+handler catches. Since the cause is not yet proven, the defence has three independent layers,
+and the instrumentation stays in place to identify which one fires.
+
+## Layer 1: pause the decoder when the head unit takes the screen
+
+The StateMgr callback (the proven channel that already delivers day/night) reports
+`parkingSensor` and `videoAddress` changes. When the parking sensor arms or the video address
+moves away from ours (`getModeMgrOnVideoAddr`), the session stops feeding the native decoder.
+Audio keeps playing, matching what native sources do during a reverse manoeuvre.
+
+When the signal clears, resume reuses the return-from-background sequence: recreate the
+decoder, reinject the cached SPS/PPS, request a keyframe. All idempotent: a false trigger
+costs one keyframe. A false negative is exactly the old behaviour, so the layer cannot make
+anything worse. The exact field semantics are undocumented; every raw value is logged
+(`head unit state: parkingSensor=... videoAddress=...`) so the car test refines the mapping.
+
+## Layer 2: relaunch after a kill
+
+The service was already START_STICKY, but its restart did nothing: the process came back
+headless and the driver found a dead app. Now a restart with a null intent (which only
+happens after a kill: user exits go through ACTION_STOP and return START_NOT_STICKY)
+relaunches the Activity after 5s.
+
+The "user left on purpose" flag is persisted in SharedPreferences, because the in-memory
+flag dies with the process and the decision is made precisely after a process death.
+Without it, a memory kill hours after the user switched to FM would pop the app over the
+radio screen.
+
+## Layer 3: diagnosis continues
+
+The 5s heartbeat, onTrimMemory/onLowMemory/onSaveInstanceState and the focus logging from
+the previous build remain. If layer 1 works, the log shows the pause/resume pair and no
+death. If the death still happens, the log now also shows whether the state signals fired
+before it, which pins down the ordering. If layer 2 fires, its line is unmistakable.

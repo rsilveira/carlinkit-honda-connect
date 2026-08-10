@@ -190,6 +190,43 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
         video.stop();
     }
 
+    /**
+     * True while the head unit has the screen (reverse camera). Feeding the native decoder
+     * in that window is the prime suspect for the foreground deaths: OMX writing into a
+     * Surface that was reclaimed by hardware, a SIGSEGV no Java handler catches.
+     */
+    private volatile boolean screenTakenByHeadUnit;
+
+    /**
+     * Called when the head unit takes the screen for itself (reverse camera) and when it
+     * hands it back. Only the video pauses; audio keeps playing, matching what the native
+     * sources do during a reverse manoeuvre.
+     *
+     * Resuming reuses the same sequence as returning from background: recreate the decoder,
+     * reinject the cached SPS/PPS (the dongle never resends them) and request a keyframe.
+     * All idempotent, so a false trigger costs one keyframe.
+     */
+    public void onScreenTakenByHeadUnit(boolean taken) {
+        screenTakenByHeadUnit = taken;
+        if (taken) {
+            video.stop();
+            Log.i(TAG, "video decoder paused: head unit took the screen");
+        } else if (surfaceReady) {
+            if (!video.start()) {
+                Log.w(TAG, "video decoder did not restart after the screen came back");
+                return;
+            }
+            if (driver != null) {
+                byte[] params = driver.parameterSetCache().parameterSets();
+                if (params != null) {
+                    video.reinjectParameterSets(params);
+                }
+                driver.requestKeyFrame();
+            }
+            Log.i(TAG, "video decoder resumed: screen handed back");
+        }
+    }
+
     /** Forwards a SurfaceView touch to the phone. */
     public boolean onTouch(MotionEvent event) {
         if (driver == null) {
@@ -269,6 +306,10 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
         receivedData = true;
         if (!surfaceReady) {
             return;   // with no Surface there is nowhere to draw; the cache keeps the SPS
+        }
+        if (screenTakenByHeadUnit) {
+            return;   // reverse camera owns the screen; without this check the next frame
+                      // would restart the decoder right after onScreenTakenByHeadUnit stopped it
         }
         if (!video.isRunning()) {
             video.start();

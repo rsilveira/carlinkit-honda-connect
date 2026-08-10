@@ -45,7 +45,8 @@ import it.smg.libs.common.Log;
  */
 public final class CarlinkitActivity extends Activity
         implements SurfaceHolder.Callback, CarlinkitSession.Callback,
-        HondaConnectManager.HondaListener, ServiceConnection {
+        HondaConnectManager.HondaListener, HondaConnectManager.ProjectionVideoListener,
+        ServiceConnection {
 
     private static final String TAG = "CarlinkitActivity";
     private static final String ACTION_USB_PERMISSION = "it.smg.hu.CARLINKIT_USB_PERMISSION";
@@ -284,9 +285,11 @@ public final class CarlinkitActivity extends Activity
             logBoth("back to the foreground — reactivating");
             userLeft = false;
         }
+        CarlinkitService.persistUserLeft(this, false);
         if (hondaEnabled()) {
             try {
                 HondaConnectManager.instance().addListener(this);
+                HondaConnectManager.instance().setProjectionVideoListener(this);
                 // Announce to ModeMgr that we took over the mode. This is the step that
                 // makes the head unit deliver the steering wheel events: the callback may
                 // be registered at the correct index and still receive nothing without
@@ -422,6 +425,7 @@ public final class CarlinkitActivity extends Activity
             try {
                 HondaConnectManager.instance().sendToBackground();
                 HondaConnectManager.instance().removeListener(this);
+                HondaConnectManager.instance().setProjectionVideoListener(null);
                 // The audio is NOT released here: any system dialog goes through
                 // onPause/onUserLeaveHint, and releasing it at this point killed the
                 // session in a loop (observed: 8 cycles in 6s during the USB permission).
@@ -436,6 +440,7 @@ public final class CarlinkitActivity extends Activity
     public void onBackPressed() {
         logBoth("onBackPressed — exit requested by the user");
         userLeft = true;
+        CarlinkitService.persistUserLeft(this, true);
         releaseSurface();
         if (hondaEnabled()) {
             try {
@@ -460,6 +465,7 @@ public final class CarlinkitActivity extends Activity
         }
         logBoth("onUserLeaveHint — user left the app");
         userLeft = true;
+        CarlinkitService.persistUserLeft(this, true);
         super.onUserLeaveHint();
     }
 
@@ -1024,6 +1030,21 @@ public final class CarlinkitActivity extends Activity
         lastTalkButtonAt = now;
         boolean sent = sendToDongle(CarlinkitProtocol.Command.SIRI);
         CarlinkitFileLog.log(TAG, "talk button (" + source + ")" + (sent ? " sent" : " NOT sent"));
+    }
+
+    /**
+     * The head unit took the screen (reverse camera) or handed it back. Pausing the decoder
+     * here is the defence against the suspected SIGSEGV: OMX writing into a Surface the
+     * head unit reclaimed by hardware. See CarlinkitSession.onScreenTakenByHeadUnit.
+     */
+    @Override
+    public void onProjectionVideoTaken(boolean taken) {
+        CarlinkitSession sess = session();
+        if (sess != null) {
+            sess.onScreenTakenByHeadUnit(taken);
+        }
+        logBoth("projection screen " + (taken ? "taken (video paused)"
+                : "returned (video resumed)") + (sess == null ? " [no session]" : ""));
     }
 
     @Override

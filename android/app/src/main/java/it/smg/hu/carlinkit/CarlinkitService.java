@@ -66,7 +66,18 @@ public final class CarlinkitService extends Service {
         }
         startForegroundCompat();
 
-        if (intent != null && ACTION_DEVICE_ATTACHED.equals(intent.getAction())) {
+        if (intent == null) {
+            // START_STICKY restart: the process was KILLED and Android brought the service
+            // back. A user exit never lands here (ACTION_STOP returns START_NOT_STICKY), so
+            // this is the crash/kill path, including the reverse gear deaths, where the
+            // app was simply gone when the driver left reverse. Relaunch the screen.
+            CarlinkitFileLog.init(this);
+            logBoth("service restarted after the process was killed; relaunching the app");
+            scheduleActivityRelaunch();
+            return START_STICKY;
+        }
+
+        if (ACTION_DEVICE_ATTACHED.equals(intent.getAction())) {
             UsbDevice device = intent.getParcelableExtra(UsbManager.EXTRA_DEVICE);
             if (device != null) {
                 // Takes advantage of the implicit permission carried by the broadcast: no
@@ -91,6 +102,56 @@ public final class CarlinkitService extends Service {
         // START_STICKY: if the head unit kills the process, the service comes back and reconnects
         return START_STICKY;
     }
+
+    /**
+     * Whether the user deliberately left the app (BACK to the FM radio, HOME). The
+     * in-memory flag dies with the process, and the relaunch decision is made precisely
+     * after a process death, so this one lives in SharedPreferences. Without it, a kill
+     * hours after the user exited would relaunch the app over whatever they were using.
+     */
+    private static final String PREFS = "carlinkit_service_state";
+    private static final String PREF_USER_LEFT = "user_left";
+
+    public static void persistUserLeft(android.content.Context ctx, boolean left) {
+        ctx.getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit().putBoolean(PREF_USER_LEFT, left).apply();
+    }
+
+    private boolean wasUserLeft() {
+        return getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(PREF_USER_LEFT, false);
+    }
+
+    /**
+     * Brings the Activity back after the process died. Delayed, for two reasons: if the
+     * death happened around reverse gear, the camera may still own the screen (it sits on
+     * a hardware plane, so launching under it is harmless, but there is no point rushing);
+     * and right after a process restart the USB stack may still be settling.
+     *
+     * The relaunched Activity walks the normal path: it finds the dongle, asks for USB
+     * permission if the device instance changed, and reconnects. From the driver's seat:
+     * leave reverse, and instead of a dead app the projection is coming back by itself.
+     */
+    private void scheduleActivityRelaunch() {
+        if (wasUserLeft()) {
+            logBoth("relaunch skipped: the user had left the app deliberately");
+            return;
+        }
+        new android.os.Handler(getMainLooper()).postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Intent open = new Intent(CarlinkitService.this, CarlinkitActivity.class);
+                    open.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    startActivity(open);
+                    logBoth("activity relaunched after the kill");
+                } catch (Throwable t) {
+                    logBoth("failed to relaunch the activity: " + t);
+                }
+            }
+        }, RELAUNCH_DELAY_MS);
+    }
+
+    private static final long RELAUNCH_DELAY_MS = 5000;
 
     private void startForegroundCompat() {
         try {

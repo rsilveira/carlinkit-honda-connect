@@ -156,6 +156,40 @@ public class HondaConnectManager {
         }
     }
 
+    /**
+     * Notified when the head unit takes the screen away from the projection (reverse gear
+     * engaging the camera) and when it hands it back. Separate from HondaListener so that
+     * existing implementors (e.g. DayNightSensor) do not need a new method.
+     */
+    public interface ProjectionVideoListener {
+        void onProjectionVideoTaken(boolean taken);
+    }
+
+    private volatile ProjectionVideoListener projectionVideoListener_;
+    /** Last state notified; starts unknown so the first event always goes through. */
+    private Boolean projectionVideoTaken_;
+
+    public void setProjectionVideoListener(ProjectionVideoListener l) {
+        projectionVideoListener_ = l;
+    }
+
+    private void notifyProjectionVideoTaken(boolean taken) {
+        if (projectionVideoTaken_ != null && projectionVideoTaken_ == taken) {
+            return;   // state did not change; the head unit repeats notifications
+        }
+        projectionVideoTaken_ = taken;
+        CarlinkitFileLog.log(TAG, "projection video " + (taken ? "TAKEN by the head unit"
+                : "handed back to the app"));
+        ProjectionVideoListener l = projectionVideoListener_;
+        if (l != null) {
+            try {
+                l.onProjectionVideoTaken(taken);
+            } catch (Throwable t) {
+                Log.e(TAG, "Error in ProjectionVideoListener", t);
+            }
+        }
+    }
+
     @SuppressLint("WrongConstant")
     private HondaConnectManager(Context context){
         if (Log.isInfo()) Log.i(TAG, "init");
@@ -1001,23 +1035,27 @@ public class HondaConnectManager {
         }
 
         /**
-         * Records the head unit state changes that precede the app being killed.
+         * Reacts to the head unit state changes around reverse gear.
          *
          * Why this exists: on 03/Aug/2026 three sessions ended mid-line with no
          * onBackPressed, no onDestroy and no exception — the signature of the process
          * being killed by the head unit, not of an application fault. Two of them had
          * been running for over 80 minutes, which is when reverse gear gets used, at the
-         * end of a trip. But the log has no record of the reverse event itself, because
-         * the app is killed before it can write anything.
+         * end of a trip. The suspected mechanism is the native OMX decoder writing into a
+         * Surface the head unit reclaimed by hardware for the camera: a SIGSEGV in C++
+         * that no Java handler can catch.
          *
          * The head unit does report the relevant transitions: parkingSensor (the parking
          * sensor arms when reverse is engaged) and videoAddress (the video source changes
          * when the reverse camera takes the screen). The app was only ever listening to
          * dayNightStateC.
          *
-         * This only LOGS, on purpose. Reacting to the signal — releasing the surface and
-         * the audio to exit gracefully — is only worth writing once the log confirms which
-         * field fires and in what order relative to the kill.
+         * The exact semantics of the two fields are undocumented, so the reaction is
+         * defensive and reversible: pausing the video decoder is harmless if triggered by
+         * mistake (audio keeps playing, and resuming reinjects SPS/PPS and requests a
+         * keyframe, both idempotent). Every raw value is still logged, so the car test
+         * refines the mapping. A false NEGATIVE costs nothing new: it is exactly the
+         * behaviour before this code existed.
          */
         private void reportVehicleStateChange(StateMgrInfo info) {
             try {
@@ -1045,10 +1083,37 @@ public class HondaConnectManager {
                 if (sb != null) {
                     CarlinkitFileLog.log(TAG, sb.toString());
                 }
+                evaluateProjectionVideoTaken(info);
             } catch (Throwable t) {
-                // Nao deixar a instrumentacao derrubar o callback de estado.
+                // Nunca deixar a protecao derrubar o callback de estado.
                 Log.e(TAG, "failed to report vehicle state", t);
             }
+        }
+
+        /** Decides whether the projection lost or regained the screen, and notifies once. */
+        private void evaluateProjectionVideoTaken(StateMgrInfo info) {
+            Boolean taken = null;
+            if (info.updateState.parkingSensorC) {
+                // The parking sensor arms with reverse gear; 0 = disarmed
+                taken = info.parkingSensor != 0;
+            }
+            if (info.updateState.videoAddressC) {
+                try {
+                    int ours = modeMgrManager_ != null
+                            ? modeMgrManager_.getModeMgrOnVideoAddr() : -1;
+                    boolean away = ours > 0 && info.videoAddress != ours;
+                    // Either signal saying "taken" wins; both must clear for a resume
+                    taken = taken == null ? away : (taken || away);
+                    CarlinkitFileLog.log(TAG, "video addr: ours=" + ours
+                            + " now=" + info.videoAddress + " away=" + away);
+                } catch (Throwable t) {
+                    Log.e(TAG, "getModeMgrOnVideoAddr failed", t);
+                }
+            }
+            if (taken == null) {
+                return;   // no relevant field changed
+            }
+            notifyProjectionVideoTaken(taken);
         }
     }
 
