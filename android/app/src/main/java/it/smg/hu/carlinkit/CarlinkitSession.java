@@ -117,6 +117,33 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
         return receivedData;
     }
 
+    /**
+     * Video frames that arrived from the dongle, and frames the decoder actually consumed.
+     *
+     * The two counters exist because "the picture froze" was reported on 10/Aug with the app
+     * otherwise alive: the microphone kept capturing and the heartbeat kept beating. Without
+     * separating these numbers there is no way to tell whether the dongle stopped sending video
+     * or the decoder stopped rendering it, and the fix differs completely.
+     */
+    public long videoFramesReceived() {
+        return videoFramesReceived;
+    }
+
+    public long videoFramesRendered() {
+        return video.framesRendered();
+    }
+
+    private volatile long videoFramesReceived;
+
+    /** Connection requests issued while the phone stays away, for the heartbeat line. */
+    public long connectRequests() {
+        return driver == null ? -1 : driver.connectRequests();
+    }
+
+    public long connectRequestsFailed() {
+        return driver == null ? -1 : driver.connectRequestsFailed();
+    }
+
     public void setCallback(Callback cb) {
         this.callback = cb;
     }
@@ -314,6 +341,7 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
     @Override
     public void onVideoFrame(VideoMessage msg, byte[] payload, boolean isParameterSet) {
         receivedData = true;
+        videoFramesReceived++;
         if (!surfaceReady) {
             return;   // with no Surface there is nowhere to draw; the cache keeps the SPS
         }

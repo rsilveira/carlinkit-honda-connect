@@ -685,9 +685,19 @@ public final class CarlinkitActivity extends Activity
                 return;
             }
             CarlinkitSession sess = session();
+            // Video counters in every beat: "sending=true" alone cannot tell a dongle that
+            // stopped sending video from a decoder that stopped rendering it, and that is
+            // exactly the distinction a frozen picture needs. Deltas between two beats say
+            // which side stalled.
             CarlinkitFileLog.log(TAG, "alive | dongle sending="
                     + (sess != null && sess.hasReceivedData())
-                    + " phone=" + phoneConnected);
+                    + " phone=" + phoneConnected
+                    + (sess == null ? "" : " video rx=" + sess.videoFramesReceived()
+                        + " rendered=" + sess.videoFramesRendered())
+                    + (sess == null || phoneConnected ? ""
+                        : " connectReq=" + sess.connectRequests()
+                          + (sess.connectRequestsFailed() > 0
+                             ? "/" + sess.connectRequestsFailed() + " failed" : "")));
             if (surfaceView != null) {
                 surfaceView.postDelayed(this, HEARTBEAT_MS);
             }

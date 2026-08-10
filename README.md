@@ -27,26 +27,32 @@ Working in the car, verified on the target head unit:
 | Android Auto (Android phone) | working |
 | CarPlay (iPhone) | working |
 | Returning to FM radio and back | working |
-| Phone calls | incoming audio works; outgoing voice needs the format fix below |
+| Phone calls, both directions | working |
+| Reverse gear | working, with **LastMode enabled** in HondaPermissions |
 | Steering wheel: phone / assistant buttons | command reaches the phone, but the head unit takes the screen in the same press |
-| Reverse gear | closes the app when **LastMode is disabled** in HondaPermissions |
 
-Measured in the car on 10/Aug and still open, with the evidence in
-[docs/FINDINGS.md](docs/FINDINGS.md):
+Two findings from the car on 10/Aug worth reading before debugging anything, with the full
+evidence in [docs/FINDINGS.md](docs/FINDINGS.md):
 
-- **Outgoing voice needed the announced format.** The capture was always healthy (peak 2884,
-  zero silent chunks, 1.3 MB delivered per call), but the microphone sent 16000 Hz while the
-  phone asked for 8000 Hz through the `InputConfig` audio command, which arrives 4 ms AFTER
-  `PhonecallStart`. The capture now restarts on that announcement instead of deferring it.
+- **Reverse gear was a configuration issue, not a bug.** The head unit closes the app on purpose
+  when `LastMode` is disabled for the package in HondaPermissions, which is precisely what that
+  parameter prevents. From inside the process this is indistinguishable from a crash: no
+  lifecycle callback, no exception, sometimes not even a focus change. Check `LastMode` and
+  `OomSetPerm` before suspecting the code. See [docs/HONDA-HEADUNIT.md](docs/HONDA-HEADUNIT.md).
+- **Outgoing call audio depends on obeying the announced format.** The capture was always
+  healthy, but the microphone sent 16000 Hz while the phone asked for 8000 Hz through the
+  `InputConfig` audio command, which arrives 4 ms AFTER `PhonecallStart`, on a capture that has
+  already started. Deferring that announcement to "the next capture" costs the whole call.
+
+Still open:
+
 - **The phone and TALK buttons cannot keep the screen.** The command does reach the phone, and
   the head unit switches to its own screen in the same gesture. It never calls `onFinishView`,
   so there is no hook to refuse the transition.
-- **Reverse gear is a configuration issue.** The head unit closes the app on purpose when
-  `LastMode` is disabled for the package in HondaPermissions, which is exactly what that
-  parameter prevents. From inside the process this is indistinguishable from a crash: no
-  lifecycle callback, no exception, sometimes not even a focus change. Enable `LastMode` (and
-  `OomSetPerm`) before suspecting the code. See
-  [docs/HONDA-HEADUNIT.md](docs/HONDA-HEADUNIT.md).
+- **The picture can freeze after a call**, with the app otherwise alive, and the dongle sometimes
+  stays in "searching for phone" after several open/close cycles. Both are under instrumentation:
+  the heartbeat now reports video frames received versus rendered, and connection requests
+  issued.
 
 Known limitations are listed in [docs/FINDINGS.md](docs/FINDINGS.md).
 

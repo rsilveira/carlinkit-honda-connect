@@ -361,6 +361,25 @@ public final class CarlinkitDriver {
         }
     }
 
+    /**
+     * Connection requests sent while no phone was connected, and how many could not even be
+     * queued.
+     *
+     * Exposed because "searching for phone" forever, reported on 10/Aug, has two very different
+     * causes: the request never leaving the app, or the dongle ignoring it. A counter that grows
+     * while the phone stays disconnected tells us the app is doing its part.
+     */
+    private volatile long connectRequests;
+    private volatile long connectRequestsFailed;
+
+    public long connectRequests() {
+        return connectRequests;
+    }
+
+    public long connectRequestsFailed() {
+        return connectRequestsFailed;
+    }
+
     /** Messages dropped because the queue was full (the dongle stopped draining). */
     public long sendDropped() {
         return sendDropped.get();
@@ -676,7 +695,14 @@ public final class CarlinkitDriver {
             }
             while (running) {
                 if (!phoneConnected) {
-                    requestPhoneConnection();
+                    if (requestPhoneConnection()) {
+                        connectRequests++;
+                    } else {
+                        connectRequestsFailed++;
+                    }
+                } else {
+                    connectRequests = 0;
+                    connectRequestsFailed = 0;
                 }
                 try {
                     Thread.sleep(10000);
