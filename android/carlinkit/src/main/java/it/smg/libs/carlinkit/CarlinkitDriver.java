@@ -27,6 +27,8 @@ public final class CarlinkitDriver {
     private static final int READ_TIMEOUT_MS = 500;
     private static final int WRITE_TIMEOUT_MS = 2000;
     private static final int HEARTBEAT_INTERVAL_MS = 2000;
+    /** Consecutive heartbeat failures tolerated before declaring the link dead. */
+    private static final int HEARTBEAT_MAX_FAILURES = 3;
 
     public interface Listener {
         /**
@@ -84,9 +86,9 @@ public final class CarlinkitDriver {
 
     private volatile boolean running;
     private volatile boolean phoneConnected;
-    private Thread readThread;
-    private Thread heartbeatThread;
-    private Thread connectThread;
+    private volatile Thread readThread;
+    private volatile Thread heartbeatThread;
+    private volatile Thread connectThread;
     private final VideoMessage.ParameterSetCache paramCache =
             new VideoMessage.ParameterSetCache();
 
@@ -155,11 +157,23 @@ public final class CarlinkitDriver {
     }
 
     /** Sends the init sequence and starts the read and heartbeat threads. */
-    public void start() {
-        if (running) {
+    public synchronized void start() {
+        if (running || stopped) {
+            // `stopped` matters as much as `running`: stop() clears running early and then
+            // works outside the monitor, so without this a start() slipping into that window
+            // would raise a whole new session for stop() to tear down underneath.
             return;
         }
+        // Leftovers from a previous session would go out BEFORE the init sequence, since the
+        // queue is FIFO, contradicting the ordering this method depends on.
+        sendQueue.clear();
         running = true;
+        // The write thread starts FIRST so the init sequence has a consumer. The queue is
+        // FIFO and nothing else is sending yet, so the 12 init messages keep the exact order
+        // the dongle expects, and start() stops blocking its caller: it used to perform 12
+        // synchronous USB writes on whichever thread opened the session.
+        writeThread = new Thread(new WriteLoop(), "carlinkit-write");
+        writeThread.start();
         sendInitSequence();
 
         readThread = new Thread(new ReadLoop(), "carlinkit-read");
@@ -170,20 +184,56 @@ public final class CarlinkitDriver {
         connectThread.start();
     }
 
+    /**
+     * Closes the session.
+     *
+     * The heavy part runs OUTSIDE the monitor on purpose. Joining four threads and writing the
+     * closing messages can take seconds, and holding the lock through it would make a
+     * concurrent start() wait just as long, on the UI thread, which is an ANR.
+     */
     public void stop() {
-        running = false;
+        Thread write, read, beat, connect;
+        synchronized (this) {
+            if (!stopped) {
+                stopped = true;
+            } else {
+                return;   // idempotent: releasing the interface twice is not harmless
+            }
+            running = false;
+            write = writeThread;
+            read = readThread;
+            beat = heartbeatThread;
+            connect = connectThread;
+        }
+        // Let the write thread finish before the closing messages, so they are not queued
+        // behind traffic that no longer matters.
+        joinQuietly(write);
         try {
-            sendCommand(CarlinkitProtocol.Command.RELEASE_VIDEO_FOCUS);
-            send(CarlinkitProtocol.Type.CLOSE_DONGLE, null);
-        } catch (Exception ignored) {
+            // Both in one critical section: the heartbeat also bypasses the queue, and letting
+            // it slip between these two would break the closing order of the protocol.
+            synchronized (writeLock) {
+                sendNow(CarlinkitProtocol.Type.COMMAND,
+                        int32(CarlinkitProtocol.Command.RELEASE_VIDEO_FOCUS));
+                sendNow(CarlinkitProtocol.Type.CLOSE_DONGLE, null);
+            }
+        } catch (Throwable ignored) {
             // the dongle may already have been unplugged
         }
-        joinQuietly(readThread);
-        joinQuietly(heartbeatThread);
-        joinQuietly(connectThread);
+        joinQuietly(read);
+        joinQuietly(beat);
+        joinQuietly(connect);
         try {
-            connection.releaseInterface(iface);
-        } catch (Exception ignored) {
+            // Under writeLock: a join that expired can leave the heartbeat mid-bulkTransfer,
+            // and releasing the interface underneath it is undefined behaviour in native code.
+            synchronized (writeLock) {
+                connection.releaseInterface(iface);
+            }
+        } catch (Throwable ignored) {
+        }
+        long dropped = sendDropped.get();
+        long failed = sendFailed.get();
+        if (dropped > 0 || failed > 0) {
+            Log.i(TAG, "send queue: " + dropped + " dropped, " + failed + " failed");
         }
     }
 
@@ -200,19 +250,155 @@ public final class CarlinkitDriver {
 
     // ---------------------------------------------------------------- sending
 
-    /** Sends the header and, when present, the payload. Synchronized: several threads write. */
-    public synchronized boolean send(int type, byte[] payload) {
-        int len = payload == null ? 0 : payload.length;
-        byte[] header = MessageHeader.toBytes(type, len);
-        int w = connection.bulkTransfer(epOut, header, header.length, WRITE_TIMEOUT_MS);
-        if (w != header.length) {
-            return false;
+    /**
+     * Outgoing message, queued so that no caller thread blocks on USB.
+     */
+    private static final class Outgoing {
+        final int type;
+        final byte[] payload;
+
+        Outgoing(int type, byte[] payload) {
+            this.type = type;
+            this.payload = payload;
         }
-        if (len > 0) {
-            w = connection.bulkTransfer(epOut, payload, len, WRITE_TIMEOUT_MS);
-            return w == len;
+    }
+
+    /**
+     * Send queue. Everything the app sends goes through here, and a single thread writes to
+     * USB.
+     *
+     * The reason is a real risk, not tidiness. A write is two bulkTransfer calls with
+     * WRITE_TIMEOUT_MS each, so up to 4s of blocking, and the write path used to be
+     * synchronized and called from four different threads:
+     *
+     *   - the UI thread, for touch and steering keys that arrive as KeyEvents
+     *   - the head unit's Binder thread, for the steering wheel service callback
+     *   - the microphone thread, one chunk every 20ms during a call or the assistant
+     *   - the heartbeat thread
+     *
+     * With a slow dongle the microphone held the lock and the head unit's Binder thread queued
+     * behind it. Blocking a system service's IPC thread for seconds can wedge the unit's own
+     * steering handling, and doing it on the UI thread is how Android declares an ANR. Neither
+     * is acceptable, and moving the work to the main thread (a tempting one-line fix) only
+     * swaps which thread hangs.
+     *
+     * Capacity is bounded because a wedged dongle would otherwise grow the queue without limit:
+     * audio alone produces 50 messages per second.
+     */
+    private static final int SEND_QUEUE_CAPACITY = 128;
+    private final java.util.concurrent.BlockingQueue<Outgoing> sendQueue =
+            new java.util.concurrent.ArrayBlockingQueue<Outgoing>(SEND_QUEUE_CAPACITY);
+    private volatile Thread writeThread;
+    /** Atomic because send() runs on several threads and the write loop increments too. */
+    private final java.util.concurrent.atomic.AtomicLong sendDropped =
+            new java.util.concurrent.atomic.AtomicLong();
+    private final java.util.concurrent.atomic.AtomicLong sendFailed =
+            new java.util.concurrent.atomic.AtomicLong();
+    /** Guards stop() against running twice, which would release the interface twice. */
+    private boolean stopped;
+
+    /**
+     * Queues a message. Returns false only when the queue could not accept it, which in
+     * practice means the dongle stopped draining.
+     *
+     * NOTE ON THE RETURN VALUE: true means "accepted for sending", not "sent". No caller can
+     * get the USB result without blocking, which is exactly what this queue exists to avoid.
+     * Callers that count failures (the microphone does) still get a useful signal, because a
+     * queue that stops draining is itself the symptom.
+     */
+    public boolean send(int type, byte[] payload) {
+        Outgoing msg = new Outgoing(type, payload);
+        if (sendQueue.offer(msg)) {
+            return true;
         }
-        return true;
+        // Queue full. Audio is the only stream dense enough to fill it, and stale audio is
+        // worthless, so drop the oldest audio to make room for whatever is being sent now.
+        // A command or a touch matters more than a 20ms chunk from the past.
+        if (dropOldestAudio() && sendQueue.offer(msg)) {
+            sendDropped.incrementAndGet();
+            return true;
+        }
+        sendDropped.incrementAndGet();
+        return false;
+    }
+
+    /** Removes the oldest AUDIO_DATA message from the queue. @return true if one was removed */
+    private boolean dropOldestAudio() {
+        for (Outgoing o : sendQueue) {
+            if (o.type == CarlinkitProtocol.Type.AUDIO_DATA && sendQueue.remove(o)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The actual USB write.
+     *
+     * Guarded by its own lock rather than trusting that only one thread gets here. The write
+     * thread is the normal caller, but two others bypass the queue on purpose: the heartbeat
+     * (which must not wait behind up to 127 audio messages, since the dongle ends the session
+     * without it) and stop(). And stop() can overlap with the write thread, because
+     * joinQuietly waits 1500 ms while one WriteLoop iteration can take up to 4.2 s. Two
+     * concurrent writers would interleave a header with someone else's payload and
+     * desynchronize the dongle's stream.
+     */
+    private final Object writeLock = new Object();
+
+    private boolean sendNow(int type, byte[] payload) {
+        synchronized (writeLock) {
+            int len = payload == null ? 0 : payload.length;
+            byte[] header = MessageHeader.toBytes(type, len);
+            int w = connection.bulkTransfer(epOut, header, header.length, WRITE_TIMEOUT_MS);
+            if (w != header.length) {
+                return false;
+            }
+            if (len > 0) {
+                w = connection.bulkTransfer(epOut, payload, len, WRITE_TIMEOUT_MS);
+                return w == len;
+            }
+            return true;
+        }
+    }
+
+    /** Messages dropped because the queue was full (the dongle stopped draining). */
+    public long sendDropped() {
+        return sendDropped.get();
+    }
+
+    /** Messages that reached USB and failed there. */
+    public long sendFailed() {
+        return sendFailed.get();
+    }
+
+    private final class WriteLoop implements Runnable {
+        @Override
+        public void run() {
+            while (running) {
+                Outgoing msg;
+                try {
+                    // Poll with a timeout so the loop notices `running` going false even
+                    // when nothing is being sent.
+                    msg = sendQueue.poll(200, java.util.concurrent.TimeUnit.MILLISECONDS);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+                if (msg == null) {
+                    continue;
+                }
+                try {
+                    if (!sendNow(msg.type, msg.payload)) {
+                        sendFailed.incrementAndGet();
+                    }
+                } catch (Throwable t) {
+                    // The dongle may have been unplugged mid-write. Disconnection is reported
+                    // by the USB_DEVICE_DETACHED broadcast, not by the read loop, so all this
+                    // thread has to do is survive and keep counting.
+                    sendFailed.incrementAndGet();
+                }
+            }
+        }
     }
 
     public boolean sendCommand(int command) {
@@ -504,10 +690,34 @@ public final class CarlinkitDriver {
     private final class HeartbeatLoop implements Runnable {
         @Override
         public void run() {
+            int consecutiveFailures = 0;
             while (running) {
-                if (!send(CarlinkitProtocol.Type.HEARTBEAT, null)) {
-                    listener.onError("heartbeat failed", null);
-                    return;
+                // sendNow, not the queue: the dongle ends the session without a heartbeat,
+                // and queueing it would put it behind up to 127 audio messages during a
+                // call. This thread is ours to block, unlike the UI and Binder threads the
+                // queue exists to protect.
+                boolean ok;
+                try {
+                    ok = sendNow(CarlinkitProtocol.Type.HEARTBEAT, null);
+                } catch (Throwable t) {
+                    // bulkTransfer on a connection that was closed or unplugged can throw, and
+                    // an uncaught exception on any thread takes the whole process down. stop()
+                    // creates exactly this window: it releases the interface after joins that
+                    // may expire while this thread is mid-write.
+                    ok = false;
+                }
+                if (!ok) {
+                    // A single failure is not fatal: one expired bulkTransfer is enough to
+                    // land here, and giving up on the first one used to kill the heartbeat for
+                    // good, with the dongle ending the session seconds later and nothing in
+                    // the log explaining why.
+                    if (++consecutiveFailures >= HEARTBEAT_MAX_FAILURES) {
+                        listener.onError("heartbeat failed " + consecutiveFailures
+                                + " times in a row", null);
+                        return;
+                    }
+                } else {
+                    consecutiveFailures = 0;
                 }
                 try {
                     Thread.sleep(HEARTBEAT_INTERVAL_MS);

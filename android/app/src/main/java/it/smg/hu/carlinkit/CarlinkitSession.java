@@ -345,6 +345,12 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
                 stopMic();
                 break;
             case AudioMessage.Command.SIRI_STOP:
+                if (phoneCallActive) {
+                    // The assistant can be invoked during a call; ending it must not take the
+                    // microphone away from the call that is still running.
+                    CarlinkitFileLog.log(TAG, "SiriStop during an active call, mic kept");
+                    break;
+                }
                 stopMic();
                 break;
             default:
@@ -362,24 +368,41 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
             return;
         }
         // The head unit must release the microphone (EcNc) before the capture
-        boolean centralOk = callback == null || callback.onMicRequested(true);
+        boolean centralAsked = callback == null || callback.onMicRequested(true);
         boolean started = mic.start();
         // In the file log, not only logcat: the head unit exposes no adb, and on 10/Aug this
         // exact line was the one missing to explain a call where the far end heard nothing.
+        //
+        // "EcNc asked" and not "EcNc ok" on purpose: startMicSession() returns void and gives
+        // up silently when the mic is disabled in settings or the service is not bound, so a
+        // true here means the request was issued, not that the head unit honoured it. The
+        // amplitude of the captured audio is the only honest evidence of that.
         CarlinkitFileLog.log(TAG, "mic requested (cmd " + command + " = "
                 + (command == AudioMessage.Command.PHONECALL_START ? "PhonecallStart" : "SiriStart")
-                + "): head unit=" + centralOk + " capture=" + started);
+                + "): EcNc asked=" + centralAsked + " capture=" + started);
+        if (!started && callback != null) {
+            // Hand the microphone back. Leaving the EcNc session open with nobody capturing is
+            // the worst of both worlds: the head unit holds the mic and the far end still hears
+            // nothing, which is indistinguishable from the failure we are chasing.
+            callback.onMicRequested(false);
+            CarlinkitFileLog.log(TAG, "mic: capture did not start, EcNc session released");
+        }
     }
 
     private void stopMic() {
-        if (mic == null || !mic.isRunning()) {
+        if (mic == null) {
             return;
         }
+        boolean wasRunning = mic.isRunning();
         mic.stop();
+        // Release EcNc even when the capture had already ended on its own (every source silent,
+        // or a fatal read). Guarding this behind isRunning() used to leave the head unit holding
+        // the microphone with nothing capturing.
         if (callback != null) {
             callback.onMicRequested(false);
         }
-        CarlinkitFileLog.log(TAG, "mic stopped, " + mic.bytesSent() + " bytes sent in total");
+        CarlinkitFileLog.log(TAG, "mic stopped (was running=" + wasRunning + "), "
+                + mic.bytesSent() + " bytes sent in total");
     }
 
     @Override
