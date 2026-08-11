@@ -194,6 +194,10 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
         video.stop();
         audio.stop();
         surfaceReady = false;
+        // The service reuses the same session object between runs, so a call flag left over
+        // from the previous run would leak into the next one and change how BACK and the
+        // wheel phone button behave.
+        phoneCallActive = false;
         Log.i(TAG, "session stopped");
     }
 
@@ -486,6 +490,12 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
     @Override
     public void onPhoneDisconnected() {
         Log.i(TAG, "phone disconnected");
+        // The call cannot survive the phone going away. Without this reset the flag stays
+        // true forever, because PhonecallStop is the only other place that clears it and it
+        // never arrives when the phone drops mid call. A stuck flag has two visible effects:
+        // the BACK button starts hanging up instead of leaving the app, and the wheel phone
+        // button sends REJECT instead of ACCEPT, so incoming calls can no longer be answered.
+        phoneCallActive = false;
         if (callback != null) {
             callback.onPhoneDisconnected();
         }

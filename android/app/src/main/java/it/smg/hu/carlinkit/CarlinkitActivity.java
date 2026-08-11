@@ -461,10 +461,54 @@ public final class CarlinkitActivity extends Activity
         }
     }
 
-    /** BACK / MENU button: the user wants to leave (e.g. to listen to FM radio). */
+    /**
+     * BACK / MENU button: the user wants to leave (e.g. to listen to FM radio).
+     *
+     * <p><b>Why leaving is not immediate.</b> On this head unit the steering wheel button that
+     * hangs up a call is physically the same BACK button. Measured on Aug 11: two of five
+     * sessions ended in {@code onBackPressed} because pressing "end call" closed the app,
+     * released the audio to the head unit and destroyed the Activity.
+     *
+     * <p>So BACK is interpreted by context:
+     * <ul>
+     *   <li><b>call in progress</b> — hang up, and stay in the app. That is what the button
+     *       means at that moment, and the driver has no other way to hang up.</li>
+     *   <li><b>no call</b> — arm a confirmation window. Leaving takes a second press, which
+     *       still allows leaving on purpose, and costs one extra press.</li>
+     * </ul>
+     * The window is short enough not to trap the user and long enough for a deliberate double
+     * press. Any other event resets it implicitly, because it expires by time.
+     */
+    private static final long BACK_CONFIRM_WINDOW_MS = 2500;
+    private long lastBackPressAt;
+
     @Override
     public void onBackPressed() {
-        logBoth("onBackPressed — exit requested by the user");
+        CarlinkitSession sess = session();
+        if (sess != null && sess.isPhoneCallActive()) {
+            // The button means "hang up" here, not "leave". Same code path as the dedicated
+            // end-call button, so the dedupe against the wheel routes still applies.
+            logBoth("BACK during a call -> hanging up instead of leaving");
+            endCallButton("BACK");
+            return;
+        }
+
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (now - lastBackPressAt > BACK_CONFIRM_WINDOW_MS) {
+            lastBackPressAt = now;
+            logBoth("BACK ignored — press again to leave");
+            // Toast and not setStatus: setStatus returns early while the phone is connected,
+            // which is exactly when this warning is needed. A silent first press would look
+            // like the button is broken.
+            try {
+                Toast.makeText(this, "Press BACK again to leave", Toast.LENGTH_SHORT).show();
+            } catch (Throwable ignored) {
+                // Losing the hint is acceptable; letting it throw out of onBackPressed is not.
+            }
+            return;
+        }
+
+        logBoth("onBackPressed — exit requested by the user (confirmed)");
         userLeft = true;
         CarlinkitService.persistUserLeft(this, true);
         releaseSurface();
@@ -486,6 +530,16 @@ public final class CarlinkitActivity extends Activity
         if (awaitingUsbPermission) {
             // The USB permission dialog takes the focus away from the Activity; that is not the user leaving
             logBoth("onUserLeaveHint ignored (USB permission dialog open)");
+            super.onUserLeaveHint();
+            return;
+        }
+        long since = android.os.SystemClock.elapsedRealtime() - lastScreenStealingCommandAt;
+        if (lastScreenStealingCommandAt != 0 && since < SCREEN_STEAL_WINDOW_MS) {
+            // The head unit is taking the screen because WE asked for the assistant or a call,
+            // not because the user wants to leave. Marking userLeft here would disable the
+            // relaunch and the app would stay off screen after the call or the assistant.
+            logBoth("onUserLeaveHint ignored (head unit took the screen " + since
+                    + "ms after our command)");
             super.onUserLeaveHint();
             return;
         }
@@ -559,6 +613,9 @@ public final class CarlinkitActivity extends Activity
         super.onNewIntent(intent);
         // Back in the app: allow reconnecting again
         userLeft = false;
+        // Also discard a pending BACK confirmation. Arming the window, leaving through MENU
+        // and coming back within 2.5 s would otherwise let the first BACK exit unconfirmed.
+        lastBackPressAt = 0;
         logBoth("onNewIntent — app reopened");
     }
 
@@ -1056,8 +1113,35 @@ public final class CarlinkitActivity extends Activity
      * answered. The window absorbs duplicates without eating deliberate repeated presses.
      */
     private static final long KEY_DEDUPE_MS = 600;
-    private long lastPhoneButtonAt;
-    private long lastTalkButtonAt;
+    // Volatile: escritos pela thread de Binder da central (rotas do volante) e lidos na main.
+    // long nao volatile nao e atomico (JLS 17.7) em ARM 32 bits, e uma leitura rasgada aqui
+    // faria o dedupe falhar; o efeito documentado disso e um segundo ACCEPT virar REJECT e
+    // derrubar a chamada que estava sendo atendida.
+    private volatile long lastPhoneButtonAt;
+    private volatile long lastTalkButtonAt;
+    /**
+     * Moment of the last command that is KNOWN to make the head unit take the screen: voice
+     * assistant and the phone buttons. Read by {@link #onUserLeaveHint()}.
+     *
+     * <p>Measured on Aug 11: the head unit calls {@code onUserLeaveHint} right after these
+     * commands, 62 ms after the assistant and 495 ms after answering a call. Without this
+     * guard the app reads that as "the user left on purpose", persists the flag and disables
+     * the relaunch, so it never comes back by itself. In five logged sessions BOTH
+     * occurrences of {@code onUserLeaveHint} came from wheel buttons and NONE from the user
+     * actually leaving.
+     *
+     * <p>Volatile because the wheel arrives on the Binder thread of the head unit while
+     * {@code onUserLeaveHint} runs on the main thread.
+     */
+    private volatile long lastScreenStealingCommandAt;
+    /**
+     * Dedupe do encerramento, separado do lastPhoneButtonAt. Compartilhar o campo fazia o BACK
+     * durante uma chamada nao desligar, nao sair e nao avisar nada, quando a chamada tinha sido
+     * atendida pelo botao do volante menos de 600 ms antes.
+     */
+    private volatile long lastEndCallAt;
+    /** Widest measured delay was 495 ms; 1500 gives margin without swallowing a real exit. */
+    private static final long SCREEN_STEAL_WINDOW_MS = 1500;
 
     private boolean dedupe(long now, long lastAt) {
         return now - lastAt < KEY_DEDUPE_MS;
@@ -1076,18 +1160,31 @@ public final class CarlinkitActivity extends Activity
         int cmd = inCall ? CarlinkitProtocol.Command.REJECT_PHONE
                 : CarlinkitProtocol.Command.ACCEPT_PHONE;
         boolean sent = sendToDongle(cmd);
+        // Only ANSWERING brings the head unit phone app to the front. Hanging up does not, and
+        // "hang up then leave through MENU" is a natural flow: the call ends and the driver
+        // goes back to the radio. Arming the guard there would keep userLeft false and let the
+        // relaunch put the app back over the radio.
+        if (sent && !inCall) {
+            lastScreenStealingCommandAt = now;
+        }
         CarlinkitFileLog.log(TAG, "phone button (" + source + "): "
                 + (inCall ? "hang up" : "accept") + (sent ? " sent" : " NOT sent"));
     }
 
     private void endCallButton(String source) {
         long now = android.os.SystemClock.elapsedRealtime();
-        if (dedupe(now, lastPhoneButtonAt)) {
+        if (dedupe(now, lastEndCallAt)) {
             CarlinkitFileLog.log(TAG, "end call (" + source + ") deduped");
             return;
         }
-        lastPhoneButtonAt = now;
         boolean sent = sendToDongle(CarlinkitProtocol.Command.REJECT_PHONE);
+        // Only consume the press when the command was ACCEPTED INTO THE QUEUE. That is what
+        // sent means here, not that the dongle received it. Marking before knowing the result
+        // would let a failed send eat the press, and the retry inside the dedupe window would
+        // do nothing at all.
+        if (sent) {
+            lastEndCallAt = now;
+        }
         CarlinkitFileLog.log(TAG, "end call (" + source + ")" + (sent ? " sent" : " NOT sent"));
     }
 
@@ -1100,6 +1197,13 @@ public final class CarlinkitActivity extends Activity
         }
         lastTalkButtonAt = now;
         boolean sent = sendToDongle(CarlinkitProtocol.Command.SIRI);
+        // Arm the guard only when the command was accepted. sendToDongle enqueues without
+        // blocking, so arming after it costs nothing in time, and arming before it would leave
+        // the guard set for 1500 ms with the head unit NOT taking the screen. That state is
+        // precisely when the user tends to leave, looking at a "searching for dongle" screen.
+        if (sent) {
+            lastScreenStealingCommandAt = now;
+        }
         CarlinkitFileLog.log(TAG, "talk button (" + source + ")" + (sent ? " sent" : " NOT sent"));
     }
 
