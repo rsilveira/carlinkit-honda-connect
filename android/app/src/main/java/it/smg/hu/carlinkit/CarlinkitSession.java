@@ -33,6 +33,12 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
 
     private static final String TAG = "CarlinkitSession";
 
+    /**
+     * Media playback format: 48000 Hz, 2 channels, 16 bit. Calls use 3 (8000 Hz) and the
+     * assistant uses 5 (16000 Hz), so seeing this one means the audio path went back to media.
+     */
+    private static final int MEDIA_DECODE_TYPE = 4;
+
     public interface Callback {
         /** phoneType: 5 = AndroidAuto, 3 = CarPlay. */
         void onPhoneConnected(int phoneType);
@@ -421,6 +427,33 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
                     break;
                 }
                 stopMic();
+                break;
+            case AudioMessage.Command.MEDIA_START:
+                // Fallback for a PhonecallStop that never arrives. Releasing the microphone
+                // depends only on the head unit's "EcNc session stopped" callback, and that
+                // callback is not guaranteed: on 17/Aug a call held the microphone for 17
+                // minutes and 16 MB of audio, and no PhonecallStop appeared in any of the 12
+                // sessions of that day.
+                //
+                // MediaStart carrying the media format is the dongle saying playback resumed,
+                // which cannot happen while a call or the assistant still owns the audio path.
+                // Measured in the same drive: it arrived 0.8 s after the assistant session
+                // ended, and not once during the 17 minutes of the call.
+                //
+                // The risk is the mirror of the reverse gear defence, which turned out to be a
+                // plausible trigger for the crash it meant to prevent: if this ever fires while
+                // a call is really running, it takes the microphone away mid call. That is why
+                // it logs before acting, so a cut call points straight at this line instead of
+                // at the dongle.
+                if (decodeType == MEDIA_DECODE_TYPE && mic != null && mic.isRunning()) {
+                    CarlinkitFileLog.log(TAG, "MediaStart in the media format while the mic was"
+                            + " running: releasing it, no PhonecallStop arrived");
+                    phoneCallActive = false;
+                    stopMic();
+                    break;
+                }
+                CarlinkitFileLog.log(TAG, "audio command " + AudioMessage.Command.name(command)
+                        + " (" + command + ") decodeType=" + decodeType + ", not handled");
                 break;
             default:
                 // Logged because the command set was mapped from captures, not documentation:
