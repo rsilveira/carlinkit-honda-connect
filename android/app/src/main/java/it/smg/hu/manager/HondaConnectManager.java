@@ -330,6 +330,13 @@ public class HondaConnectManager {
                         + context_.getPackageName() + " (privileges will be denied)");
             }
         } catch (Throwable t){
+            // File log, not Log.e: this head unit exposes no adb, so a logcat-only error is
+            // invisible. On 17/Aug neither the entry line nor the "NO entry" line reached the
+            // file log across 12 drive sessions, which means this catch is what ran and nobody
+            // could see why. oomSetPerm decides whether the head unit kills this app, so losing
+            // the reason here costs a whole test drive.
+            CarlinkitFileLog.log(TAG, "whitelist: could not read the entry for "
+                    + context_.getPackageName() + ": " + t);
             Log.e(TAG, "process control error", t);
         }
 
