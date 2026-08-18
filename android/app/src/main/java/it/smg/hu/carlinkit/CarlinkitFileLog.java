@@ -49,8 +49,29 @@ public final class CarlinkitFileLog {
 
     private static CarlinkitFileLog instance;
 
+    private static final String TIME_PATTERN = "HH:mm:ss.SSS";
+
+    /**
+     * Lines logged before {@link #init(Context)} had a chance to run.
+     *
+     * <p>Without this buffer they are handed to a log file that does not exist yet and are lost
+     * without a trace. That is not a corner case: the Honda integration reads the head unit
+     * whitelist from the Application's onCreate, which runs before any Activity exists, so the
+     * whitelist entry was logged on every single start and never reached one file. It decides
+     * whether the head unit may kill this app, and two test drives were spent looking for it.
+     *
+     * <p>Timestamps are taken when the line is buffered, not when it is flushed, otherwise every
+     * early line would claim to have happened at the moment the log opened.
+     */
+    private static final List<String> pendingLines = new ArrayList<String>();
+    /** Bounded: a run that never opens a log file must not grow this forever. */
+    private static final int MAX_PENDING_LINES = 100;
+    private static int droppedPendingLines;
+    private static final SimpleDateFormat PENDING_TIME_FORMAT =
+            new SimpleDateFormat(TIME_PATTERN, Locale.US);
+
     private final SimpleDateFormat timeFormat =
-            new SimpleDateFormat("HH:mm:ss.SSS", Locale.US);
+            new SimpleDateFormat(TIME_PATTERN, Locale.US);
     private PrintWriter writer;
     private File file;
     private String targetKind = "?";
@@ -91,6 +112,34 @@ public final class CarlinkitFileLog {
             }
             writeLine("--- end of diagnostics ---");
         }
+        flushPending();
+    }
+
+    /** Writes what was logged before this file existed, preserving the original timestamps. */
+    private void flushPending() {
+        if (pendingLines.isEmpty() && droppedPendingLines == 0) {
+            return;
+        }
+        writeLine("--- " + pendingLines.size() + " line(s) logged before the log file existed ---");
+        for (String line : pendingLines) {
+            writeStamped(line);
+        }
+        if (droppedPendingLines > 0) {
+            writeLine("--- " + droppedPendingLines + " earlier line(s) dropped: buffer holds "
+                    + MAX_PENDING_LINES + " ---");
+        }
+        writeLine("--- end of the pre-init lines ---");
+        pendingLines.clear();
+        droppedPendingLines = 0;
+    }
+
+    /** Keeps a line until a log file exists. Called only from the synchronized static methods. */
+    private static void buffer(String line) {
+        if (pendingLines.size() >= MAX_PENDING_LINES) {
+            droppedPendingLines++;
+            return;
+        }
+        pendingLines.add(PENDING_TIME_FORMAT.format(new Date()) + " " + line);
     }
 
     /**
@@ -327,11 +376,17 @@ public final class CarlinkitFileLog {
     public static synchronized void log(String tag, String message) {
         if (instance != null) {
             instance.writeLine(tag + ": " + message);
+        } else {
+            buffer(tag + ": " + message);
         }
     }
 
     public static synchronized void log(String tag, String message, Throwable t) {
         if (instance == null) {
+            buffer(tag + ": " + message);
+            if (t != null) {
+                buffer("  " + t.getClass().getName() + ": " + t.getMessage());
+            }
             return;
         }
         instance.writeLine(tag + ": " + message);
@@ -356,11 +411,16 @@ public final class CarlinkitFileLog {
     }
 
     private synchronized void writeLine(String line) {
+        writeStamped(timeFormat.format(new Date()) + " " + line);
+    }
+
+    /** Writes a line that already carries its timestamp. */
+    private synchronized void writeStamped(String line) {
         if (writer == null) {
             return;
         }
         try {
-            writer.println(timeFormat.format(new Date()) + " " + line);
+            writer.println(line);
             writer.flush();   // the app can be killed without warning
             if (file != null && file.length() > MAX_SIZE_BYTES) {
                 writer.println("=== size limit reached (" + MAX_SIZE_BYTES / 1024 + " KB) ===");
