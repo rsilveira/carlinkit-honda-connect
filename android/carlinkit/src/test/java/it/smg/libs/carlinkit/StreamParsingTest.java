@@ -168,6 +168,26 @@ public class StreamParsingTest {
         assertNull(AudioMessage.formatOf(99));
     }
 
+    /**
+     * The channel count is what separates media from voice, and the microphone release in
+     * CarlinkitSession depends on it. Media is stereo: 48000 Hz was measured with Android Auto
+     * and 44100 Hz with an iPhone. Voice is mono, whether it is a call at 8000 Hz or the
+     * assistant at 16000 Hz. A change here silently disables that release, which is how a guard
+     * written against decodeType 4 alone turned into dead code the first time an iPhone
+     * connected.
+     */
+    @Test
+    public void separatesMediaFromVoiceByChannelCount() {
+        for (int decodeType : new int[]{1, 2, 4, 7}) {
+            assertEquals("decodeType " + decodeType + " should be media (stereo)",
+                    2, AudioMessage.formatOf(decodeType).channels);
+        }
+        for (int decodeType : new int[]{3, 5, 6}) {
+            assertEquals("decodeType " + decodeType + " should be voice (mono)",
+                    1, AudioMessage.formatOf(decodeType).channels);
+        }
+    }
+
     @Test
     public void rejectsShortAudioPayload() {
         assertNull(AudioMessage.parse(new byte[8], 8));

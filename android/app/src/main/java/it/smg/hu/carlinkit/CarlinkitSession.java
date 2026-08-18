@@ -34,10 +34,22 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
     private static final String TAG = "CarlinkitSession";
 
     /**
-     * Media playback format: 48000 Hz, 2 channels, 16 bit. Calls use 3 (8000 Hz) and the
-     * assistant uses 5 (16000 Hz), so seeing this one means the audio path went back to media.
+     * Whether the format carries media rather than voice.
+     *
+     * <p>The protocol separates the two by channel count: media comes back in stereo, 44100 Hz
+     * with an iPhone and 48000 Hz with Android Auto, while the assistant and calls are mono at
+     * 8000, 16000 or 24000 Hz. Reusing {@link AudioMessage#formatOf(int)} keeps that knowledge
+     * in the one place it was mapped from the captures.
+     *
+     * <p>This started as a comparison against decodeType 4, the format of Android Auto, and an
+     * iPhone reached the same guard with decodeType 2. The guard then did nothing at all and the
+     * log said "not handled", which is silent failure: testing one observed value treats the
+     * first phone that was measured as if it were the protocol.
      */
-    private static final int MEDIA_DECODE_TYPE = 4;
+    private static boolean isMediaFormat(int decodeType) {
+        AudioMessage.Format format = AudioMessage.formatOf(decodeType);
+        return format != null && format.channels == 2;
+    }
 
     public interface Callback {
         /** phoneType: 5 = AndroidAuto, 3 = CarPlay. */
@@ -445,7 +457,7 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
                 // a call is really running, it takes the microphone away mid call. That is why
                 // it logs before acting, so a cut call points straight at this line instead of
                 // at the dongle.
-                if (decodeType == MEDIA_DECODE_TYPE && mic != null && mic.isRunning()) {
+                if (isMediaFormat(decodeType) && mic != null && mic.isRunning()) {
                     CarlinkitFileLog.log(TAG, "MediaStart in the media format while the mic was"
                             + " running: releasing it, no PhonecallStop arrived");
                     phoneCallActive = false;
