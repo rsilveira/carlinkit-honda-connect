@@ -40,6 +40,9 @@ public final class CarlinkitService extends Service {
     /** Sent by the receiver when the USB broadcast arrives, carrying the implicit permission. */
     public static final String ACTION_DEVICE_ATTACHED = "it.smg.hu.carlinkit.DEVICE_ATTACHED";
 
+    /** Asks the dongle to drop the connected phone, so another one can take the link. */
+    public static final String ACTION_DISCONNECT_PHONE = "it.smg.hu.carlinkit.DISCONNECT_PHONE";
+
     private final CarlinkitBinder binder = new CarlinkitBinder();
     private CarlinkitSession session;
     private UsbDeviceConnection connection;
@@ -63,6 +66,19 @@ public final class CarlinkitService extends Service {
             stopSession();
             stopSelf();
             return START_NOT_STICKY;
+        }
+        if (intent != null && ACTION_DISCONNECT_PHONE.equals(intent.getAction())) {
+            // By Intent and not by binding: the settings screen only needs to fire this once,
+            // and binding there would add a service connection lifecycle to a fragment for a
+            // single command. Same reason ACTION_STOP works this way.
+            CarlinkitFileLog.init(this);
+            CarlinkitSession current = session();
+            if (current == null) {
+                logBoth("disconnect phone ignored: no active session");
+            } else {
+                current.disconnectPhone();
+            }
+            return START_STICKY;
         }
         startForegroundCompat();
 

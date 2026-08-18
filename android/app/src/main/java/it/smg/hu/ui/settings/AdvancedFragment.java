@@ -98,6 +98,29 @@ public class AdvancedFragment extends BaseSettingsFragment {
             });
         }
 
+        android.widget.Button btnDisconnectPhone = view.findViewById(R.id.btn_disconnect_phone);
+        if (btnDisconnectPhone != null) {
+            btnDisconnectPhone.setOnClickListener(v -> {
+                Log.i(TAG, "Phone disconnection requested from the UI");
+                try {
+                    // startService and not binding: this fires one command and needs no reply.
+                    // The service owns the session, so it works with the projection in the
+                    // background, which is where it is while this screen is open.
+                    android.content.Intent intent = new android.content.Intent(
+                            getActivity(), it.smg.hu.carlinkit.CarlinkitService.class);
+                    intent.setAction(it.smg.hu.carlinkit.CarlinkitService.ACTION_DISCONNECT_PHONE);
+                    getActivity().startService(intent);
+                    android.widget.Toast.makeText(getActivity(),
+                            "Phone disconnected. Open the app to let another one connect.",
+                            android.widget.Toast.LENGTH_LONG).show();
+                } catch (Throwable t) {
+                    Log.e(TAG, "Error requesting the phone disconnection", t);
+                    android.widget.Toast.makeText(getActivity(), "Failed: " + t.getMessage(),
+                            android.widget.Toast.LENGTH_SHORT).show();
+                }
+            });
+        }
+
         return view;
     }
 

@@ -560,9 +560,40 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
     @Override
     public void onMessage(int type, byte[] payload) {
         receivedData = true;
+        // Logged once per type and per session, to the file log. These are the messages the app
+        // does not handle, and the list includes the ones that would answer whether the dongle
+        // reports phone identity at all: BluetoothPairedList (0x12), BluetoothDeviceName (0x0D)
+        // and BluetoothAddress (0x0A). Until now they went only to Log.v, and this head unit
+        // exposes no logcat, so their absence from the logs meant nothing either way. Once per
+        // type because the log file is capped at 512 KB and a repeating message would fill it.
+        if (unhandledTypesSeen.add(Integer.valueOf(type))) {
+            CarlinkitFileLog.log(TAG, "message not handled: "
+                    + CarlinkitProtocol.typeName(type) + " (0x"
+                    + Integer.toHexString(type) + "), "
+                    + (payload == null ? 0 : payload.length) + " bytes");
+        }
         if (Log.isVerbose()) {
             Log.v(TAG, "msg " + CarlinkitProtocol.typeName(type));
         }
+    }
+
+    /** Types already reported by {@link #onMessage}, so each one is logged a single time. */
+    private final java.util.Set<Integer> unhandledTypesSeen =
+            java.util.Collections.synchronizedSet(new java.util.HashSet<Integer>());
+
+    /**
+     * Asks the dongle to drop the phone that is connected, so another one can take the link.
+     *
+     * @return true if the request reached the dongle
+     */
+    public boolean disconnectPhone() {
+        if (driver == null) {
+            CarlinkitFileLog.log(TAG, "disconnect phone requested with no driver");
+            return false;
+        }
+        boolean sent = driver.disconnectPhone();
+        CarlinkitFileLog.log(TAG, "disconnect phone requested by the user: sent=" + sent);
+        return sent;
     }
 
     @Override

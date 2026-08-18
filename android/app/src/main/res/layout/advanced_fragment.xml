@@ -164,6 +164,15 @@
         android:text=""/>
 
     <Button
+        android:id="@+id/btn_disconnect_phone"
+        android:layout_width="match_parent"
+        android:layout_height="64dp"
+        android:layout_marginTop="20dp"
+        android:text="Disconnect the current phone"
+        android:textColor="#FFFFFF"
+        android:background="#1976D2" />
+
+    <Button
         android:id="@+id/btn_reset_honda"
         android:layout_width="match_parent"
         android:layout_height="64dp"

@@ -508,6 +508,17 @@ public final class CarlinkitDriver {
     }
 
     /**
+     * Asks the dongle to drop the phone it is connected to.
+     *
+     * <p>Type 0x0F, no payload. What the dongle does next is unknown: it may offer the link to
+     * another phone or take the same one back. Sending it is the only way to find out, and the
+     * connection that follows is logged, so one drive answers it.
+     */
+    public boolean disconnectPhone() {
+        return send(CarlinkitProtocol.Type.DISCONNECT_PHONE, null);
+    }
+
+    /**
      * Requests a new keyframe. Needed when the Surface is recreated, since the dongle sends
      * only one IDR at the beginning of the stream.
      */
