@@ -58,6 +58,21 @@ public final class CarlinkitActivity extends Activity
     private boolean serviceBound;
     private boolean sessionStarted;
     private volatile boolean phoneConnected;
+    /**
+     * Whether the dongle has ever reported a phone state in this session.
+     *
+     * <p>A session that starts with the phone already attached receives no state callback at
+     * all, so {@code phoneConnected} stays false while the phone works normally. Measured in a
+     * 76 minute session: the flag read false for 67 minutes while music played and a 17 minute
+     * call ran, and the first state event to arrive was a disconnect. Printing that false in
+     * the log as if it were an observation is what led to reading a healthy 39 minute session
+     * as a dongle that never delivered the phone.
+     *
+     * <p>Only the log uses this. The behaviour of the app is unchanged on purpose: the dongle
+     * does need the periodic connect request, and 235 of them in one session came with zero
+     * phone drops, so there is no measured reason to stop sending them.
+     */
+    private volatile boolean phoneStateReported;
     /** Set when the user leaves the app on purpose, so it does not reopen by itself. */
     private volatile boolean userLeft;
     /** Dongle detected before the Surface existed; opened once the Surface is ready. */
@@ -748,7 +763,7 @@ public final class CarlinkitActivity extends Activity
             // which side stalled.
             CarlinkitFileLog.log(TAG, "alive | dongle sending="
                     + (sess != null && sess.hasReceivedData())
-                    + " phone=" + phoneConnected
+                    + " phone=" + (phoneStateReported ? String.valueOf(phoneConnected) : "unknown")
                     + (sess == null ? "" : " video rx=" + sess.videoFramesReceived()
                         + " rendered=" + sess.videoFramesRendered())
                     + (sess == null || phoneConnected ? ""
@@ -1007,6 +1022,7 @@ public final class CarlinkitActivity extends Activity
         final String kind = phoneType == 5 ? "Android Auto"
                 : phoneType == 3 ? "CarPlay" : "type " + phoneType;
         logBoth("phone connected: " + kind);
+        phoneStateReported = true;
         phoneConnected = true;
         hideStatus();
     }
@@ -1014,6 +1030,7 @@ public final class CarlinkitActivity extends Activity
     @Override
     public void onPhoneDisconnected() {
         logBoth("phone disconnected");
+        phoneStateReported = true;
         phoneConnected = false;
         setStatus("phone disconnected");
     }
