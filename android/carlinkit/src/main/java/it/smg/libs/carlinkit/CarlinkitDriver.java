@@ -64,7 +64,22 @@ public final class CarlinkitDriver {
         public int packetMax = 49152;
         public int iBoxVersion = 2;
         public int phoneWorkMode = 2;
-        public int mediaDelay = 300;
+        /**
+         * Media audio delay in milliseconds, sent to the dongle in BoxSettings.
+         *
+         * ⚠️ This was 300, the bottom of the usable range, and it is the worst possible value
+         * for stuttering. The dongle's own help text, read from its web interface on 26/Aug,
+         * states: default 1000 ms, usable range 300 to 2000, and "the larger the delay, the
+         * less likely stuttering occurs; the smaller, the more music and picture are in sync".
+         * The app sent 300 on every session, overriding whatever the dongle had, so the box was
+         * always put in its most stutter-prone configuration.
+         *
+         * 1000 is the manufacturer's default, not a guess. The cost is up to 700 ms more audio
+         * latency against the picture, which for music and navigation prompts is not noticeable
+         * the way dropouts are. If lip sync ever matters more than smoothness, lower it, and
+         * the useful floor is 300.
+         */
+        public int mediaDelay = 1000;
         public int dpi = 140;
         /** MANDATORY for Android phones; without it the dongle does not connect. */
         public boolean androidWorkMode = true;
