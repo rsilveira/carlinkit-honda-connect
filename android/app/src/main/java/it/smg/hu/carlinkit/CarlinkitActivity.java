@@ -750,6 +750,13 @@ public final class CarlinkitActivity extends Activity
      */
     private static final int HEARTBEAT_MS = 5000;
 
+    /**
+     * How long the frame count may stand still, with the phone connected and the screen ours,
+     * before the stall is reported. Calibrated on 6 days of logs: no healthy session stalled
+     * for more than 10 s, and the real freeze on 24/Aug lasted 35 s.
+     */
+    private static final int VIDEO_STALL_MS = 20000;
+
     private final Runnable sessionHeartbeat = new Runnable() {
         @Override
         public void run() {
@@ -757,6 +764,8 @@ public final class CarlinkitActivity extends Activity
                 return;
             }
             CarlinkitSession sess = session();
+            String decode = sess == null ? null : sess.drainDecodeStats();
+            String audioWrite = sess == null ? null : sess.drainAudioStats();
             // Video counters in every beat: "sending=true" alone cannot tell a dongle that
             // stopped sending video from a decoder that stopped rendering it, and that is
             // exactly the distinction a frozen picture needs. Deltas between two beats say
@@ -769,12 +778,83 @@ public final class CarlinkitActivity extends Activity
                     + (sess == null || phoneConnected ? ""
                         : " connectReq=" + sess.connectRequests()
                           + (sess.connectRequestsFailed() > 0
-                             ? "/" + sess.connectRequestsFailed() + " failed" : "")));
+                             ? "/" + sess.connectRequestsFailed() + " failed" : ""))
+                    // Only when non-zero: a healthy write path would add noise to every beat,
+                    // and these numbers only matter when they move.
+                    + (sess == null || (sess.sendDropped() <= 0 && sess.sendFailed() <= 0) ? ""
+                        : " sendDropped=" + sess.sendDropped()
+                          + " sendFailed=" + sess.sendFailed())
+                    // Decode timing separates "the dongle sent less" from "our decoder blocked
+                    // the read loop", which the frame counters alone cannot do.
+                    + (decode == null ? "" : " decode " + decode)
+                    // AudioTrack.write now runs on a dedicated worker. Queue depth/drop and
+                    // write timing show whether it is keeping up without blocking USB.
+                    + (audioWrite == null ? "" : " audioWrite " + audioWrite));
+            checkVideoStall(sess);
             if (surfaceView != null) {
                 surfaceView.postDelayed(this, HEARTBEAT_MS);
             }
         }
     };
+
+    /** Frame count at the previous beat, to measure a stall across beats. */
+    private long lastBeatFrames = -1;
+    /** How long the frame count has stood still while the picture should be moving. */
+    private long stalledMs;
+    /** True while a stall is being reported, so the log gets one line per stall, not per beat. */
+    private boolean stallReported;
+
+    /**
+     * Detects a dongle that keeps the session but stops sending video.
+     *
+     * The existing watchdog deliberately only fires when NOTHING was ever received, because a
+     * dongle that goes quiet with a static screen is normal. That leaves the failure measured
+     * on 24/Aug uncovered: video flowed, then the count froze at 2446 for 35 s with the phone
+     * still connected, and the picture was stuck while the app looked perfectly healthy.
+     *
+     * Threshold calibrated against 6 days of logs, counting only stretches with the phone
+     * connected and the screen ours:
+     *
+     *   healthy sessions (11 sessions, 4 days)   longest stall 0 to 10 s, none above 20 s
+     *   24/Aug session 091620                    35 s
+     *
+     * So 20 s is twice the worst healthy case and still catches the real one. The action is
+     * the cheapest one available, a keyframe request, which is the same call already made when
+     * the head unit hands the screen back. It logs BEFORE acting: the reverse gear defence
+     * became a plausible trigger for the very crash it meant to prevent, so anything that
+     * touches the video path has to be visible in the log first.
+     *
+     * No session restart here on purpose. A wedged dongle needed a car power cycle in the
+     * 01/Aug tests, and this stall recovered on its own after 35 s, so tearing the session
+     * down would be a guess with a real cost.
+     */
+    private void checkVideoStall(CarlinkitSession sess) {
+        if (sess == null || !phoneConnected || sess.isScreenTakenByHeadUnit()) {
+            lastBeatFrames = -1;
+            stalledMs = 0;
+            stallReported = false;
+            return;
+        }
+        long frames = sess.videoFramesReceived();
+        if (lastBeatFrames >= 0 && frames == lastBeatFrames) {
+            stalledMs += HEARTBEAT_MS;
+            if (stalledMs >= VIDEO_STALL_MS && !stallReported) {
+                stallReported = true;
+                CarlinkitFileLog.log(TAG, "video stalled for " + (stalledMs / 1000)
+                        + "s with the phone connected (rx frozen at " + frames
+                        + "): asking the dongle for a keyframe");
+                sess.requestKeyFrame();
+            }
+        } else {
+            if (stallReported) {
+                CarlinkitFileLog.log(TAG, "video recovered after " + (stalledMs / 1000)
+                        + "s stalled");
+            }
+            stalledMs = 0;
+            stallReported = false;
+        }
+        lastBeatFrames = frames;
+    }
 
     /**
      * Warns when the dongle enumerates, accepts a session and then stays silent.

@@ -162,6 +162,43 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
         return driver == null ? -1 : driver.connectRequestsFailed();
     }
 
+    /**
+     * Write path counters, for the heartbeat line.
+     *
+     * These existed already but only reached Log.i, which is logcat, and this head unit does
+     * not expose logcat. On 24/Aug that gap made a diagnosis impossible: the picture froze for
+     * 35 s and the phone dropped every 15 to 25 s, and there was no way to tell whether our
+     * writes to the dongle were failing or the dongle was failing on its own. Absence of a
+     * line in the file log is not evidence while the only path is logcat.
+     */
+    public long sendDropped() {
+        return driver == null ? -1 : driver.sendDropped();
+    }
+
+    public long sendFailed() {
+        return driver == null ? -1 : driver.sendFailed();
+    }
+
+    /** Asks the dongle for a keyframe. Used by the stall detector in the heartbeat. */
+    public boolean requestKeyFrame() {
+        return driver != null && driver.requestKeyFrame();
+    }
+
+    /** Decode timing for the heartbeat. @see CarlinkitVideoRenderer#drainDecodeStats() */
+    public String drainDecodeStats() {
+        return video == null ? null : video.drainDecodeStats();
+    }
+
+    /** AudioTrack write timing for the heartbeat. */
+    public String drainAudioStats() {
+        return audio == null ? null : audio.drainAudioStats();
+    }
+
+    /** @return true while the head unit owns the screen, so a stall is expected */
+    public boolean isScreenTakenByHeadUnit() {
+        return screenTakenByHeadUnit;
+    }
+
     public void setCallback(Callback cb) {
         this.callback = cb;
     }
