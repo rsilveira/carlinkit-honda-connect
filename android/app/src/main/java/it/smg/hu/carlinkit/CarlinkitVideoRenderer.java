@@ -120,12 +120,65 @@ public final class CarlinkitVideoRenderer {
             buf.put(payload, msg.dataOffset, msg.dataLength);
             buf.flip();
             // timestamp in microseconds; the dongle does not send its own PTS
+            //
+            // ⚠️ This call is synchronous and runs on the driver's read loop. If the decoder
+            // blocks waiting for an input buffer, the read loop stops draining USB, the dongle
+            // backs up, and the throughput collapses. That failure is invisible in the frame
+            // counters: rx and rendered fall together and stay equal, which reads like a
+            // healthy decoder. Measured on 25/Aug: video held the 47 msg/s baseline with music
+            // and collapsed to 4 to 10 msg/s the moment navigation started, with rx == rendered
+            // throughout, so the counters could not tell the decoder apart from the link.
+            //
+            // These numbers exist to settle that: if the slow count and the max climb during
+            // navigation, the bottleneck is here, inside the app, and decoupling the decode
+            // from the read loop is the fix. If they stay flat, the app is only receiving less.
+            long t0 = System.nanoTime();
             codec.mediaDecode(System.nanoTime() / 1000L, buf, msg.dataLength);
+            long ms = (System.nanoTime() - t0) / 1000000L;
+            if (ms > decodeMaxMs) {
+                decodeMaxMs = ms;
+            }
+            if (ms >= DECODE_SLOW_MS) {
+                decodeSlowCount++;
+            }
+            decodeTotalMs += ms;
             frames++;
         } catch (Throwable t) {
             Log.e(TAG, "error decoding frame", t);
         }
     }
+
+    /** A decode call at or above this is long enough to throttle the read loop. */
+    private static final long DECODE_SLOW_MS = 40;
+
+    private volatile long decodeMaxMs;
+    private volatile long decodeSlowCount;
+    private volatile long decodeTotalMs;
+
+    /**
+     * Decode timing since the last call, then resets, so the heartbeat reports per interval
+     * instead of a total that only ever grows.
+     *
+     * @return "max=Nms slow=N avg=Nms" or null when nothing was decoded in the interval
+     */
+    public synchronized String drainDecodeStats() {
+        long f = frames - decodeStatsLastFrames;
+        decodeStatsLastFrames = frames;
+        if (f <= 0) {
+            decodeMaxMs = 0;
+            decodeSlowCount = 0;
+            decodeTotalMs = 0;
+            return null;
+        }
+        String s = "max=" + decodeMaxMs + "ms slow=" + decodeSlowCount
+                + " avg=" + (decodeTotalMs / f) + "ms";
+        decodeMaxMs = 0;
+        decodeSlowCount = 0;
+        decodeTotalMs = 0;
+        return s;
+    }
+
+    private long decodeStatsLastFrames;
 
     /**
      * Reinjects the cached SPS/PPS. Needed when the decoder is recreated, since the dongle
