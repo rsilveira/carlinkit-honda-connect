@@ -560,6 +560,30 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
     @Override
     public void onMessage(int type, byte[] payload) {
         receivedData = true;
+        // The dongle announces its own firmware and the settings it actually applied, and both
+        // were being thrown away. That mattered on 25/Aug: with every app-side path measured
+        // clean (write queue, decode timing, heartbeat, rendered == rx) and the throughput still
+        // collapsing from 55 to under 3 messages a second during navigation, the dongle became
+        // the remaining suspect, and its firmware version is the first thing needed to check
+        // whether an update exists. BoxSettings answers a second question: the app asks for
+        // 800x480 at 20 fps, yet 55 messages a second arrive, so the dongle appears to ignore
+        // the request. What it echoes back says which values it really uses.
+        if (type == CarlinkitProtocol.Type.SOFTWARE_VERSION) {
+            String v = asciiOf(payload);
+            if (v != null && !dongleVersionLogged) {
+                dongleVersionLogged = true;
+                CarlinkitFileLog.log(TAG, "dongle firmware: " + v);
+            }
+            return;
+        }
+        if (type == CarlinkitProtocol.Type.BOX_SETTINGS) {
+            String v = asciiOf(payload);
+            if (v != null && !boxSettingsLogged) {
+                boxSettingsLogged = true;
+                CarlinkitFileLog.log(TAG, "dongle settings: " + v);
+            }
+            return;
+        }
         // Logged once per type and per session, to the file log. These are the messages the app
         // does not handle, and the list includes the ones that would answer whether the dongle
         // reports phone identity at all: BluetoothPairedList (0x12), BluetoothDeviceName (0x0D)
@@ -575,6 +599,33 @@ public final class CarlinkitSession implements CarlinkitDriver.Listener {
         if (Log.isVerbose()) {
             Log.v(TAG, "msg " + CarlinkitProtocol.typeName(type));
         }
+    }
+
+    private volatile boolean dongleVersionLogged;
+    private volatile boolean boxSettingsLogged;
+
+    /**
+     * Printable ASCII from a dongle payload, for the two messages that carry text.
+     *
+     * Both are fixed-size buffers padded with NUL, and BoxSettings is JSON, so the bytes are
+     * trimmed at the first NUL and anything unprintable is replaced instead of dropped: a
+     * payload that turns out not to be text has to be visible as such rather than silently
+     * become an empty string.
+     */
+    private static String asciiOf(byte[] payload) {
+        if (payload == null || payload.length == 0) {
+            return null;
+        }
+        StringBuilder sb = new StringBuilder(payload.length);
+        for (int i = 0; i < payload.length; i++) {
+            int c = payload[i] & 0xFF;
+            if (c == 0) {
+                break;
+            }
+            sb.append(c >= 0x20 && c < 0x7F ? (char) c : '.');
+        }
+        String s = sb.toString().trim();
+        return s.isEmpty() ? null : s;
     }
 
     /** Types already reported by {@link #onMessage}, so each one is logged a single time. */
