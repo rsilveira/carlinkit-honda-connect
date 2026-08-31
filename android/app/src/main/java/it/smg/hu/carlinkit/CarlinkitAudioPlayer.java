@@ -39,14 +39,230 @@ public final class CarlinkitAudioPlayer {
     private final java.util.HashMap<Integer, AudioTrack> tracks =
             new java.util.HashMap<Integer, AudioTrack>();
     private AudioTrack track;
-    private int currentDecodeType = -1;
+    private volatile int currentDecodeType = -1;
+    private volatile int activeTrackCount;
     private volatile boolean running;
     /** In the background the dongle stays connected, but we must not play audio. */
     private volatile boolean muted;
-    private long bytesWritten;
+    private volatile long bytesWritten;
 
-    public synchronized void start() {
-        running = true;
+    private static final long AUDIO_WRITE_SLOW_MS = 20;
+    private static final long WORKER_STOP_WAIT_MS = 500;
+    private long audioWriteCount;
+    private long audioWriteTotalMs;
+    private long audioWriteMaxMs;
+    private long audioWriteSlowCount;
+    private long audioWritePartialCount;
+    private long audioWriteErrorCount;
+    private long audioInputCount;
+    private long audioInputBytes;
+    private long audioInputMaxGapMs;
+    private long audioInputLastNs;
+    private volatile int audioTrackBufferBytes;
+
+    /** Runs on the USB read loop before the payload is copied into the worker queue. */
+    private synchronized void recordAudioInput(int bytes) {
+        long now = System.nanoTime();
+        if (audioInputLastNs != 0) {
+            long gapMs = (now - audioInputLastNs) / 1000000L;
+            if (gapMs > audioInputMaxGapMs) {
+                audioInputMaxGapMs = gapMs;
+            }
+        }
+        audioInputLastNs = now;
+        audioInputCount++;
+        audioInputBytes += bytes;
+    }
+
+    /**
+     * AudioTrack write timing since the previous call, then resets the interval counters.
+     *
+     * The output includes the current format and number of live tracks because the navigation
+     * path can alternate media and voice formats. Since fbd66b6 those tracks are cached instead
+     * of released; if the problem starts only after navigation, seeing two live tracks matters.
+     *
+     * @return interval stats, or null when no PCM was written in the interval
+     */
+    public synchronized String drainAudioStats() {
+        long droppedTotal = audioQueueDropped.get();
+        long dropped = droppedTotal - audioQueueDroppedLast;
+        audioQueueDroppedLast = droppedTotal;
+        int queueMax = audioQueueMaxDepth.getAndSet(audioQueue.size());
+        String workerProblem = audioWorkerProblem;
+        if (audioWriteCount == 0 && audioInputCount == 0 && dropped == 0 && queueMax == 0
+                && workerProblem == null) {
+            return null;
+        }
+        String s = "type=" + currentDecodeType
+                + " tracks=" + activeTrackCount
+                + " in=" + audioInputCount
+                + " inBytes=" + audioInputBytes
+                + " maxGap=" + audioInputMaxGapMs + "ms"
+                + " buffer=" + audioTrackBufferBytes + "B"
+                + " q=" + audioQueue.size() + "/" + AUDIO_QUEUE_CAPACITY
+                + " qmax=" + queueMax
+                + (dropped > 0 ? " qdrop=" + dropped : "")
+                + (audioWriteCount == 0 ? " noWrites"
+                    : " writes=" + audioWriteCount
+                      + " max=" + audioWriteMaxMs + "ms"
+                      + " slow=" + audioWriteSlowCount
+                      + " avg=" + (audioWriteTotalMs / audioWriteCount) + "ms")
+                + (audioWritePartialCount > 0 ? " partial=" + audioWritePartialCount : "")
+                + (audioWriteErrorCount > 0 ? " errors=" + audioWriteErrorCount : "")
+                + (workerProblem != null ? " worker=" + workerProblem : "");
+        audioWriteCount = 0;
+        audioWriteTotalMs = 0;
+        audioWriteMaxMs = 0;
+        audioWriteSlowCount = 0;
+        audioWritePartialCount = 0;
+        audioWriteErrorCount = 0;
+        audioInputCount = 0;
+        audioInputBytes = 0;
+        audioInputMaxGapMs = 0;
+        return s;
+    }
+
+    /**
+     * PCM queue between the USB read loop and AudioTrack.
+     *
+     * Incoming payload arrays are reused by the driver, so each queued chunk owns a copy.
+     * 16 chunks are roughly 320 ms at the observed 20 ms cadence. A high-water mark trims
+     * back to 4 chunks (~80 ms) before the queue is full: real-time voice and navigation audio
+     * must drop stale samples instead of playing them hundreds of milliseconds late.
+     */
+    private static final int AUDIO_QUEUE_CAPACITY = 16;
+    private static final int AUDIO_QUEUE_HIGH_WATERMARK = 12;
+    private static final int AUDIO_QUEUE_TARGET = 4;
+    private final java.util.concurrent.BlockingQueue<AudioWork> audioQueue =
+            new java.util.concurrent.ArrayBlockingQueue<AudioWork>(AUDIO_QUEUE_CAPACITY);
+    private final Object lifecycleLock = new Object();
+    private volatile Thread audioThread;
+    private final java.util.concurrent.atomic.AtomicLong audioQueueDropped =
+            new java.util.concurrent.atomic.AtomicLong();
+    private long audioQueueDroppedLast;
+    private final java.util.concurrent.atomic.AtomicInteger audioQueueMaxDepth =
+            new java.util.concurrent.atomic.AtomicInteger();
+    private volatile String audioWorkerProblem;
+
+    private static final class AudioWork {
+        static final int PCM = 1;
+        static final int COMMAND = 2;
+        static final int MUTE = 3;
+
+        final int kind;
+        final int decodeType;
+        final int command;
+        final byte[] pcm;
+        final int pcmLength;
+        final boolean muted;
+
+        private AudioWork(int kind, int decodeType, int command, byte[] pcm, int pcmLength,
+                boolean muted) {
+            this.kind = kind;
+            this.decodeType = decodeType;
+            this.command = command;
+            this.pcm = pcm;
+            this.pcmLength = pcmLength;
+            this.muted = muted;
+        }
+
+        static AudioWork pcm(int decodeType, byte[] pcm, int pcmLength) {
+            return new AudioWork(PCM, decodeType, 0, pcm, pcmLength, false);
+        }
+
+        static AudioWork command(int command, int decodeType) {
+            return new AudioWork(COMMAND, decodeType, command, null, 0, false);
+        }
+
+        static AudioWork mute(boolean muted) {
+            return new AudioWork(MUTE, 0, 0, null, 0, muted);
+        }
+    }
+
+
+    /** Reuses PCM arrays so decoupling the read loop does not create 50 allocations per second. */
+    private final java.util.ArrayDeque<byte[]> pcmPool = new java.util.ArrayDeque<byte[]>();
+
+    private byte[] acquirePcmBuffer(int length) {
+        synchronized (pcmPool) {
+            java.util.Iterator<byte[]> it = pcmPool.iterator();
+            while (it.hasNext()) {
+                byte[] candidate = it.next();
+                if (candidate.length >= length) {
+                    it.remove();
+                    return candidate;
+                }
+            }
+        }
+        return new byte[length];
+    }
+
+    private void recyclePcmBuffer(byte[] buffer) {
+        if (buffer == null) {
+            return;
+        }
+        synchronized (pcmPool) {
+            if (pcmPool.size() < AUDIO_QUEUE_CAPACITY) {
+                pcmPool.addLast(buffer);
+            }
+        }
+    }
+
+    /** Clears queued work and returns its PCM arrays to the pool. */
+    private void clearQueueAndRecycle() {
+        AudioWork work;
+        while ((work = audioQueue.poll()) != null) {
+            if (work.kind == AudioWork.PCM) {
+                recyclePcmBuffer(work.pcm);
+            }
+        }
+    }
+    public void start() {
+        synchronized (lifecycleLock) {
+            if (running) {
+                return;
+            }
+            // stop() may still be waiting for a native AudioTrack.write to return. Never start a
+            // second consumer against the same tracks: that would create concurrent writes and
+            // release-with-write-in-flight. Give the old worker the same window stop() gives it.
+            long deadline = System.currentTimeMillis() + WORKER_STOP_WAIT_MS;
+            while (audioThread != null && audioThread.isAlive()) {
+                long left = deadline - System.currentTimeMillis();
+                if (left <= 0) {
+                    audioWorkerProblem = "start-refused-prev-worker-alive";
+                    CarlinkitFileLog.log(TAG, "audio start refused: previous worker still alive");
+                    return;
+                }
+                try {
+                    lifecycleLock.wait(left);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    return;
+                }
+            }
+            clearQueueAndRecycle();
+            audioQueueDropped.set(0);
+            audioQueueDroppedLast = 0;
+            audioQueueMaxDepth.set(0);
+            synchronized (this) {
+                audioWriteCount = 0;
+                audioWriteTotalMs = 0;
+                audioWriteMaxMs = 0;
+                audioWriteSlowCount = 0;
+                audioWritePartialCount = 0;
+                audioWriteErrorCount = 0;
+                audioInputCount = 0;
+                audioInputBytes = 0;
+                audioInputMaxGapMs = 0;
+                audioInputLastNs = 0;
+            }
+            audioTrackBufferBytes = 0;
+            audioWorkerProblem = null;
+            running = true;
+            Thread t = new Thread(new AudioWriteLoop(), "CarlinkitAudioWrite");
+            audioThread = t;
+            t.start();
+        }
     }
 
     /**
@@ -54,25 +270,46 @@ public final class CarlinkitAudioPlayer {
      * USB connection is kept to avoid re-enumeration, but the audio has to stop so it does
      * not compete with the FM radio.
      */
-    public synchronized void setMuted(boolean value) {
+    public void setMuted(boolean value) {
         muted = value;
-        for (AudioTrack t : tracks.values()) {
-            try {
-                if (value) {
-                    t.pause();
-                    t.flush();
-                } else {
-                    t.play();
-                }
-            } catch (Throwable ignored) {
-            }
+        if (!running) {
+            return;
         }
+        offerControl(AudioWork.mute(value), value);
     }
 
-    public synchronized void stop() {
-        running = false;
-        releaseTrack();
-        Log.i(TAG, "stopped (" + bytesWritten + " bytes played)");
+    public void stop() {
+        Thread t;
+        synchronized (lifecycleLock) {
+            if (!running && audioThread == null) {
+                return;
+            }
+            running = false;
+            clearQueueAndRecycle();
+            t = audioThread;
+            if (t != null) {
+                t.interrupt();
+            }
+        }
+        if (t != null) {
+            try {
+                t.join(WORKER_STOP_WAIT_MS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+            synchronized (lifecycleLock) {
+                if (audioThread == t && !t.isAlive()) {
+                    audioThread = null;
+                }
+                lifecycleLock.notifyAll();
+            }
+            if (t.isAlive()) {
+                CarlinkitFileLog.log(TAG, "audio worker still blocked "
+                        + WORKER_STOP_WAIT_MS + "ms after stop");
+            }
+        }
+        Log.i(TAG, "stopped (" + bytesWritten + " bytes played, "
+                + audioQueueDropped.get() + " queued chunks dropped)");
     }
 
     private void releaseTrack() {
@@ -87,6 +324,7 @@ public final class CarlinkitAudioPlayer {
             }
         }
         tracks.clear();
+        activeTrackCount = 0;
         track = null;
         currentDecodeType = -1;
     }
@@ -98,6 +336,12 @@ public final class CarlinkitAudioPlayer {
      */
     private boolean ensureTrack(int decodeType) {
         if (track != null && currentDecodeType == decodeType) {
+            if (!muted && track.getPlayState() != AudioTrack.PLAYSTATE_PLAYING) {
+                try {
+                    track.play();
+                } catch (Throwable ignored) {
+                }
+            }
             return true;
         }
         // Reuse the track for this format if it already exists. This is the whole point of the
@@ -148,6 +392,8 @@ public final class CarlinkitAudioPlayer {
                 fresh.play();
             }
             tracks.put(Integer.valueOf(decodeType), fresh);
+            activeTrackCount = tracks.size();
+            audioTrackBufferBytes = bufSize;
             track = fresh;
             currentDecodeType = decodeType;
             // In the file log too: the format the dongle SENDS is the best available clue to
@@ -155,7 +401,8 @@ public final class CarlinkitAudioPlayer {
             // 8000Hz during a call while the microphone was sending 16000Hz upstream, which is
             // why the far end heard nothing. The head unit exposes no logcat to check it any
             // other way. Logged once per format, not per switch.
-            CarlinkitFileLog.log(TAG, "audio out: decodeType=" + decodeType + " -> " + f);
+            CarlinkitFileLog.log(TAG, "audio out: decodeType=" + decodeType + " -> " + f
+                    + " buffer=" + bufSize + "B");
             return true;
         } catch (Throwable t) {
             Log.e(TAG, "failed to create the AudioTrack for " + f, t);
@@ -163,31 +410,34 @@ public final class CarlinkitAudioPlayer {
         }
     }
 
-    /** Handles an audio message from the dongle. */
-    public synchronized void onAudio(AudioMessage msg, byte[] payload) {
+    /**
+     * Handles an audio message from the dongle without blocking the USB read loop.
+     *
+     * PCM payloads are copied because the driver reuses its read buffer immediately after this
+     * callback returns. AudioTrack creation, switching, flushing and writes all belong to the
+     * AudioWriteLoop; no AudioTrack method runs on the USB thread anymore.
+     */
+    public void onAudio(AudioMessage msg, byte[] payload) {
         if (!running || msg == null) {
             return;
         }
         switch (msg.kind) {
             case AudioMessage.KIND_COMMAND:
-                handleCommand(msg);
+                // Commands keep FIFO order but do not purge PCM from other decodeTypes. A
+                // NAVI_STOP followed by media packets must not erase 80-240 ms of music.
+                offerControl(AudioWork.command(msg.command, msg.decodeType), false);
                 break;
             case AudioMessage.KIND_PCM:
+                if (payload == null || msg.pcmLength <= 0) {
+                    return;
+                }
+                recordAudioInput(msg.pcmLength);
                 if (muted) {
-                    return;   // dropped in the background: no audio on top of the FM radio
+                    return;
                 }
-                if (ensureTrack(msg.decodeType)) {
-                    try {
-                        int n = track.write(payload, msg.pcmOffset, msg.pcmLength);
-                        if (n > 0) {
-                            bytesWritten += n;
-                        } else if (n < 0) {
-                            Log.e(TAG, "AudioTrack.write returned " + n);
-                        }
-                    } catch (Throwable t) {
-                        Log.e(TAG, "error writing PCM", t);
-                    }
-                }
+                byte[] copy = acquirePcmBuffer(msg.pcmLength);
+                System.arraycopy(payload, msg.pcmOffset, copy, 0, msg.pcmLength);
+                offerPcm(AudioWork.pcm(msg.decodeType, copy, msg.pcmLength));
                 break;
             default:
                 // volumeDuration: informational
@@ -195,20 +445,217 @@ public final class CarlinkitAudioPlayer {
         }
     }
 
-    private void handleCommand(AudioMessage msg) {
-        String name = AudioMessage.Command.name(msg.command);
-        Log.i(TAG, "AudioCommand " + name + " (decodeType=" + msg.decodeType
-                + " audioType=" + msg.audioType + ")");
-        switch (msg.command) {
+    /** Keeps current audio: if full, drops the oldest queued PCM and retries once. */
+    private void offerPcm(AudioWork work) {
+        int trimmed = 0;
+        if (audioQueue.size() >= AUDIO_QUEUE_HIGH_WATERMARK) {
+            while (audioQueue.size() > AUDIO_QUEUE_TARGET && dropOldestPcm()) {
+                trimmed++;
+            }
+            if (trimmed > 0) {
+                audioQueueDropped.addAndGet(trimmed);
+            }
+        }
+        if (audioQueue.offer(work)) {
+            updateQueueMaxDepth();
+            return;
+        }
+        if (dropOldestPcm()) {
+            audioQueueDropped.incrementAndGet();
+            if (audioQueue.offer(work)) {
+                updateQueueMaxDepth();
+                return;
+            }
+        }
+        // The newest chunk also lost the race for the freed slot. It never reached the worker,
+        // so its array must return to the pool here.
+        recyclePcmBuffer(work.pcm);
+        audioQueueDropped.incrementAndGet();
+    }
+
+    /** Controls may purge stale PCM when they stop a source or mute the head unit. */
+    private void offerControl(AudioWork work, boolean purgePcm) {
+        int purged = 0;
+        if (purgePcm) {
+            while (dropOldestPcm()) {
+                purged++;
+            }
+        }
+        if (purged > 0) {
+            audioQueueDropped.addAndGet(purged);
+        }
+        if (audioQueue.offer(work)) {
+            updateQueueMaxDepth();
+            return;
+        }
+        // A queue full of controls is not useful state. Keep the newest command/mute event.
+        int discarded = audioQueue.size();
+        clearQueueAndRecycle();
+        audioQueueDropped.addAndGet(discarded);
+        if (!audioQueue.offer(work)) {
+            audioWorkerProblem = "control-enqueue-failed";
+            CarlinkitFileLog.log(TAG, "audio control enqueue failed after clearing queue");
+        }
+        updateQueueMaxDepth();
+    }
+
+    private boolean dropOldestPcm() {
+        for (AudioWork w : audioQueue) {
+            if (w.kind == AudioWork.PCM && audioQueue.remove(w)) {
+                recyclePcmBuffer(w.pcm);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void updateQueueMaxDepth() {
+        int depth = audioQueue.size();
+        int seen = audioQueueMaxDepth.get();
+        while (depth > seen && !audioQueueMaxDepth.compareAndSet(seen, depth)) {
+            seen = audioQueueMaxDepth.get();
+        }
+    }
+
+
+    /** The only thread allowed to create, switch, flush, write or release AudioTracks. */
+    private final class AudioWriteLoop implements Runnable {
+        @Override
+        public void run() {
+            final Thread self = Thread.currentThread();
+            try {
+                while (running && audioThread == self) {
+                    AudioWork work;
+                    try {
+                        work = audioQueue.poll(200,
+                                java.util.concurrent.TimeUnit.MILLISECONDS);
+                    } catch (InterruptedException e) {
+                        if (!running || audioThread != self) {
+                            return;
+                        }
+                        continue;
+                    }
+                    if (work == null) {
+                        continue;
+                    }
+                    switch (work.kind) {
+                        case AudioWork.PCM:
+                            try {
+                                writePcm(work.decodeType, work.pcm, work.pcmLength);
+                            } finally {
+                                recyclePcmBuffer(work.pcm);
+                            }
+                            break;
+                        case AudioWork.COMMAND:
+                            handleCommand(work.command, work.decodeType);
+                            break;
+                        case AudioWork.MUTE:
+                            applyMuted(work.muted);
+                            break;
+                        default:
+                            break;
+                    }
+                }
+            } catch (Throwable t) {
+                audioWorkerProblem = "dead-" + t.getClass().getSimpleName();
+                CarlinkitFileLog.log(TAG, "audio worker died: " + t.getClass().getName()
+                        + ": " + t.getMessage());
+                Log.e(TAG, "audio worker died", t);
+                synchronized (lifecycleLock) {
+                    if (audioThread == self) {
+                        running = false;
+                    }
+                }
+            } finally {
+                // AudioTrack release stays on the same thread that writes to it. This avoids a
+                // release racing with a blocked write when stop() times out waiting for us.
+                releaseTrack();
+                synchronized (lifecycleLock) {
+                    if (audioThread == self) {
+                        audioThread = null;
+                        running = false;
+                    }
+                    lifecycleLock.notifyAll();
+                }
+            }
+        }
+    }
+
+    private void writePcm(int decodeType, byte[] pcm, int pcmLength) {
+        if (muted || pcm == null || pcmLength <= 0) {
+            return;
+        }
+        if (!ensureTrack(decodeType)) {
+            synchronized (this) {
+                audioWriteErrorCount++;
+            }
+            return;
+        }
+        long t0 = System.nanoTime();
+        try {
+            int n = track.write(pcm, 0, pcmLength);
+            long ms = (System.nanoTime() - t0) / 1000000L;
+            recordWrite(ms, n, pcmLength, false);
+        } catch (Throwable t) {
+            long ms = (System.nanoTime() - t0) / 1000000L;
+            recordWrite(ms, -1, pcmLength, true);
+            Log.e(TAG, "error writing PCM", t);
+        }
+    }
+
+    private synchronized void recordWrite(long ms, int n, int expected, boolean threw) {
+        audioWriteCount++;
+        audioWriteTotalMs += ms;
+        if (ms > audioWriteMaxMs) {
+            audioWriteMaxMs = ms;
+        }
+        if (ms >= AUDIO_WRITE_SLOW_MS) {
+            audioWriteSlowCount++;
+        }
+        if (n > 0) {
+            bytesWritten += n;
+            if (n != expected) {
+                audioWritePartialCount++;
+            }
+        } else if (n < 0 || threw) {
+            audioWriteErrorCount++;
+            if (!threw) {
+                Log.e(TAG, "AudioTrack.write returned " + n);
+            }
+        }
+    }
+
+    private void applyMuted(boolean value) {
+        for (AudioTrack t : tracks.values()) {
+            try {
+                if (value) {
+                    t.pause();
+                    t.flush();
+                } else {
+                    t.play();
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+    private void handleCommand(int command, int decodeType) {
+        String name = AudioMessage.Command.name(command);
+        Log.i(TAG, "AudioCommand " + name + " decodeType=" + decodeType + " (worker)");
+        switch (command) {
             case AudioMessage.Command.OUTPUT_STOP:
             case AudioMessage.Command.MEDIA_STOP:
             case AudioMessage.Command.PHONECALL_STOP:
             case AudioMessage.Command.NAVI_STOP:
             case AudioMessage.Command.SIRI_STOP:
-                // Flush the buffer so no leftover audio is left behind when the source changes
-                if (track != null) {
+                // Flush only the format that stopped. Navigation and media can alternate in the
+                // same queue; flushing the current pointer may erase the other source.
+                AudioTrack stopped = tracks.get(Integer.valueOf(decodeType));
+                if (stopped != null) {
                     try {
-                        track.flush();
+                        if (stopped.getPlayState() == AudioTrack.PLAYSTATE_PLAYING) {
+                            stopped.pause();
+                        }
+                        stopped.flush();
                     } catch (Throwable ignored) {
                     }
                 }
