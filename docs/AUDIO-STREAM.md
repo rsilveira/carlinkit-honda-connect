@@ -117,24 +117,58 @@ Points to watch:
    `SoundOut` is the appropriate setting.
 3. `MediaStart`/`MediaStop` are good hooks for requesting and releasing audio focus on the head
    unit.
+4. **`AudioTrack.write` must not run on the thread that reads from USB.** The call blocks, and
+   creating, writing, flushing and releasing the track all used to happen on the read loop, so a
+   stall inside `AudioTrack` would stop video and audio alike. The playback path now owns a
+   dedicated worker fed by a bounded queue. Details and the numbers behind the sizing are in
+   [FINDINGS.md](FINDINGS.md), section "Wireless degradation".
 
-## Phone calls do not reach this code path (observed in the car, Aug 9)
+   Two decisions there are worth repeating because they are counter intuitive:
 
-The `PhonecallStart`/`PhonecallStop` commands and the 8 kHz mono format exist in the protocol,
-but with the phone paired to the car over Bluetooth they are not what happens in practice.
+   - When the queue fills it drops the **oldest** PCM, not the newest. In audio the stale end of
+     the buffer is the part nobody wants to hear.
+   - The buffer handed in by the driver is **reused**, so the worker has to copy it. A pool keeps
+     that from becoming roughly 50 allocations a second at 48 kHz stereo.
 
-Observed: when a call starts, the head unit switches away from the projection app to its own
-phone application and handles the call over HFP, the same way it does with no dongle connected.
-Returning to projection afterwards is manual. The app receives no call audio and its microphone
-capture is not involved.
+## Whether phone calls reach this code path depends on the Bluetooth pairing
 
-The practical consequences:
+The `PhonecallStart`/`PhonecallStop` commands and the 8 kHz mono format exist in the protocol, and
+whether they are exercised depends entirely on the Bluetooth pairing between phone and car.
 
-- Call audio quality is the head unit's native telephony, including the manufacturer's echo
-  cancellation. There is nothing to implement or tune here, and nothing this app can break.
-- `CarlinkitMicrophone` therefore serves the **voice assistant** only.
-- The 8 kHz call format is presumably used by dongles running without a Bluetooth pairing
-  between phone and car. That configuration has not been tested here.
+**Phone paired to the car (observed Aug 9).** When a call starts, the head unit switches away from
+the projection app to its own phone application and handles the call over HFP, the same way it
+does with no dongle connected. Returning to projection afterwards is manual. The app receives no
+call audio and its microphone capture is not involved. Call quality is the head unit's native
+telephony, including the manufacturer's echo cancellation, so there is nothing to implement or
+tune, and nothing this app can break.
+
+⚠️ **Phone NOT paired to the car (observed Aug 10, and this corrects the section above).** The
+original version of this text concluded that `CarlinkitMicrophone` "serves the voice assistant
+only" and that the 8 kHz path "has not been tested here". Both statements were wrong within a day
+of being written. With the phone unpaired from the car, the call goes through Android Auto, this
+code path handles it end to end, and calls were confirmed working in **both directions** in the
+car.
+
+⚠️ **The format trap that costs the whole call.** The capture was always healthy. The failure was
+that the microphone sent 16000 Hz while the phone had asked for 8000 Hz through the `InputConfig`
+audio command, and that command arrives **4 ms after** `PhonecallStart`, on a capture that has
+already started:
+
+```
+12:54:55.195  mic: capture started ... 16000Hz mono (decodeType 5)
+12:54:55.196  mic requested (cmd 4 = PhonecallStart)
+12:54:55.199  InputConfig: the phone asks for capture decodeType 3
+```
+
+Storing that value "for the next capture" means the entire call runs in the wrong format.
+`setDecodeType` has to restart the capture when the format changes. `InputConfig` was parsed and
+discarded in the inherited code, with a comment calling it a mere announcement, and it is the only
+source for this information.
+
+⚠️ **Measure amplitude, not state.** Three sessions of hypothesis ended with one number. Checking
+that a recorder opened says nothing: `peak 0` means the head unit did not route the microphone to
+the app, and `peak 2000+` means real speech was captured and any loss is downstream. The grey
+microphone icon in Android Auto is cosmetic; audio flows regardless.
 
 An "Enable HFP" checkbox existed in the settings screen, inherited from OpenDroidAuto. Nothing
 in this project ever read it: the only audio related negotiation sent to the dongle is the

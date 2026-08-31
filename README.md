@@ -20,7 +20,7 @@ Working in the car, verified on the target head unit:
 | Feature | Status |
 |---|---|
 | Video (H.264 → OMX → screen, full screen 800x480) | working |
-| Audio out (PCM → `AudioTrack`, all speakers) | working |
+| Audio out (PCM → `AudioTrack`, all speakers) | working over a cable; **stutters intermittently over Wi-Fi**, see below |
 | Touch input | working |
 | Steering wheel: volume, next/previous track | working |
 | Day/night following the headlights | working |
@@ -46,21 +46,33 @@ evidence in [docs/FINDINGS.md](docs/FINDINGS.md):
 
 Still open:
 
+- 🔴 **Audio and video starve over Wi-Fi, intermittently.** This is the main open issue. The
+  interface becomes very slow and music unlistenable, and selecting a navigation route reproduces
+  it almost at once. Measured: the dongle drops from 117 PCM messages per 5 s window to between 23
+  and 42, with gaps up to 4.6 s, while this app's queue stays empty and its writes track arrivals
+  exactly. **A cable is stable** over 17 and 41 minute runs, and healthy wireless is
+  indistinguishable from cable, so the head unit and the phone can both sustain the stream. Ten
+  other explanations were eliminated by measurement, including the decoder and this app's own write
+  path. Full evidence and the counters that measure it are in
+  [docs/FINDINGS.md](docs/FINDINGS.md), section "Wireless degradation".
 - **The phone and TALK buttons cannot keep the screen.** The command does reach the phone, and
   the head unit switches to its own screen in the same gesture. It never calls `onFinishView`,
   so there is no hook to refuse the transition.
-- **The picture can freeze after a call**, with the app otherwise alive, and the dongle sometimes
-  stays in "searching for phone" after several open/close cycles. Both are under instrumentation:
-  the heartbeat now reports video frames received versus rendered, and connection requests
-  issued.
+- **The dongle sometimes stays in "searching for phone"** after several open/close cycles. The
+  heartbeat counts `connectReq`, and one session issued 235 requests over 39 minutes without the
+  box ever handing the phone over. A car power cycle clears it.
+
+A picture that freezes with the app otherwise alive now has a detector rather than only
+instrumentation: 20 s of a frozen frame count, with the phone connected and the screen ours, logs
+the stall and asks the dongle for a keyframe. The threshold comes from 6 days of logs.
 
 Known limitations are listed in [docs/FINDINGS.md](docs/FINDINGS.md).
 
 ## What to expect in daily use
 
-The features above work, but three behaviours are visible every time you use it. None is a
-defect in this app. The first two come from the dongle and the head unit, the third is a
-consequence of how the car handles telephony, and knowing about them saves a lot of confusion.
+The features above work, but four behaviours are visible every time you use it. Only the last one
+is a real problem; the first three are the dongle, the head unit and the way the car handles
+telephony, and knowing about them saves a lot of confusion.
 
 **A USB permission dialog appears on almost every launch.** The dongle re-enumerates on the
 USB bus constantly (its own watchdog reboots it roughly 9s after the host stops talking to
@@ -86,11 +98,26 @@ behind and you have to switch back to the app when the call ends.
 This is a tradeoff rather than a fault. Call audio goes through Honda's telephony stack, with
 the echo cancellation the manufacturer tuned for this cabin, so the far end hears what it would
 hear normally. What you give up is the projected in call UI and the automatic return to
-projection afterwards. It also means the microphone capture in this app serves the **voice
-assistant only**: during a call the app never sees the audio.
+projection afterwards. In **that** configuration the microphone capture in this app serves the
+voice assistant only, because during a call the app never sees the audio.
 
 If you want calls to go through the dongle instead, unpair the phone from the car's Bluetooth.
-That has not been tested here, and it means giving up the native echo cancellation.
+That **was** tested, on 10/Aug, and it works in both directions: the call goes through Android
+Auto and this app handles the audio, at 8 kHz mono. What you give up is the native echo
+cancellation tuned for this cabin.
+
+**Music and the interface can stutter badly over Wi-Fi.** This is the one behaviour that makes the
+app unpleasant rather than merely quirky, and it is the main open issue. It starts fine and
+degrades within minutes, and asking a navigation app for a route reproduces it almost at once.
+It is **intermittent**: sessions of 30 and 76 minutes have run perfectly clean with the same
+settings, and then the next one is unusable.
+
+Measured, so you can tell it apart from an app problem: over Wi-Fi in the bad state the dongle
+delivers 23 to 42 audio packets per 5 second window instead of 117, with silences up to 4.6
+seconds, while this app's playback queue sits empty. **Over a cable it does not happen**, and
+healthy Wi-Fi is indistinguishable from cable. So if it bothers you, use the cable. The full
+evidence, including ten explanations that were tested and ruled out, is in
+[docs/FINDINGS.md](docs/FINDINGS.md).
 
 ## Target hardware
 

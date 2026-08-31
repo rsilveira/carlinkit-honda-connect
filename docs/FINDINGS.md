@@ -63,7 +63,11 @@ SendOpen -> SendBoxSettings(JSON) -> Command(wifiEnable=1000)
          + HeartBeat (0xAA) every 2s
 ```
 The `SendBoxSettings` payload is ASCII JSON:
-`{"mediaDelay":300,"syncTime":<ms>,"androidAutoSizeW":800,"androidAutoSizeH":480}`
+`{"mediaDelay":1000,"syncTime":<ms>,"androidAutoSizeW":800,"androidAutoSizeH":480}`
+
+⚠️ That first field read `300` until 26/Aug, and 300 is the bottom of the range and the value most
+prone to stuttering. The box documents 1000 ms as its default, a 300 to 2000 range, and that a
+larger delay makes stuttering less likely. See "Wireless degradation" below.
 
 Responses received: `Open`, `Command`, `BoxSettings`, `SoftwareVersion`,
 `BluetoothDeviceName`, `WifiDeviceName`, `HiCarLink`, `BluetoothPairedList`, `0x26`(?).
@@ -444,3 +448,141 @@ registerModeMgrSWKeyEventCallback(idx=213) ret=213
 The first version treated `ret != 0` as refusal and discarded the callback, so every
 `initAudioBinding` registered it again: 15 registrations across four sessions, all successful
 and all thrown away. Now `ret == idx` counts as success.
+
+---
+
+# Wireless degradation: the dongle starves audio and video (Aug 17 to 27, 2026)
+
+The interface becomes very slow and music unlistenable. It starts normal and degrades within
+minutes. Restarting the phone and power cycling the dongle do not fix it. Selecting a route in a
+navigation app reproduces it almost immediately, and on 26/Aug music also stuttered on a static
+player screen, with no navigation involved.
+
+This section exists mostly to record what was **refuted**, because ten plausible explanations
+were eliminated by measurement before the cause was isolated, and several of them were the
+maintainer's own.
+
+## The dongle, identified
+
+`SoftwareVersion` and `BoxSettings` were parsed and discarded. Decoding them gives the box
+identity, which the investigation needed and did not have:
+
+```
+product     A15W          boxType   YA
+hardware    YMYE-WB58-0000
+firmware    2022.11.19.1218CAY        MFD 20221119
+Wi-Fi       channel 36, AP 1x1 VHT 80 MHz
+interface   HTTP on the dongle's own AP
+RPC         /cgi-bin/server.cgi with cmd=infos, cmd=set, cmd=reset
+```
+
+Its own web interface documents three settings that matter here, and the values found in the box:
+
+| Setting | Box guidance | Found as |
+|---|---|---|
+| `bitRate` | for stuttering, use under 8 Mbps | 0 |
+| `fps` | for visible lag, use 20 | 0 |
+| `mediaDelay` | default 1000 ms, range 300 to 2000, larger stutters less | 300 |
+
+The app was sending 300 on every session, overriding the box with the worst value in the range.
+That is fixed. `bitRate=4` and `fps=20` were applied to the box, and a factory reset was performed
+and the settings reapplied. **None of it removed the symptom.**
+
+The manufacturer's own update endpoint returns an empty version, size 0 and no path, even when
+queried while claiming a 2020 firmware. There is no official image to roll back to, so third party
+firmware is not an option here.
+
+## What the app measures now, and how to read it
+
+The heartbeat line carries every counter that separates one suspect from another:
+
+```
+alive | dongle sending=true phone=unknown video rx=N rendered=M connectReq=N
+        decode max=Xms slow=N avg=Yms
+        audioWrite type=4 tracks=1 in=N inBytes=N maxGap=Xms buffer=NB
+                   q=N/16 qmax=N writes=N max=Xms slow=N avg=Yms
+```
+
+| Reading | Conclusion |
+|---|---|
+| `maxGap` large and `in` falling | the dongle stopped delivering PCM, upstream of this app |
+| `maxGap` small, `in` steady, audio still bad | playback or the head unit, not delivery |
+| `qdrop` climbing | the worker is not keeping up, but no longer blocks USB |
+| `decode max` large or `slow` non zero | the decoder is throttling the read loop |
+| `sendDropped` or `sendFailed` non zero | the app's own write path to the dongle is failing |
+
+`in` counts PCM messages per 5 s interval, so 117 is the healthy figure at 48 kHz stereo, roughly
+23 per second.
+
+## Measured signatures
+
+Same head unit, same app build, same afternoon:
+
+| Condition | `in` median | gap median | gap p90 | gap max | windows over 500 ms |
+|---|---|---|---|---|---|
+| Wireless, degraded | 23 to 42 | 131 to 3430 ms | 3797 ms | 4578 ms | 26 of 54, 4 of 6 |
+| Wireless, healthy | 117 | 70 to 76 ms | 183 ms | 202 ms | 0 of 34 |
+| Wired, 17 min | 117 | 71 ms | 175 ms | 228 ms | 0 |
+| Wireless, healthy 30 min | 117 | 70 ms | 183 ms | 4369 ms | 3 of 365, all in the first 25 s |
+
+Three things follow. Cable and healthy wireless are **indistinguishable**, so the head unit, the
+decoder, the USB path and the phone can all sustain the stream. The degraded state is
+**intermittent**, not a fixed ceiling: degraded and healthy sessions alternate within the same
+afternoon with identical settings, and one 76 minute session on 17/Aug was clean throughout. And
+once a session locks in healthy it tends to stay healthy: in the 30 minute session the only bad
+windows are the first three.
+
+In every degraded session the queue stayed at `q=0` with `qmax` between 1 and 3 against a capacity
+of 16, `qdrop` stayed at zero, and `writes` tracked `in` exactly. **The app is not the bottleneck.**
+
+## Hypotheses refuted, with the evidence
+
+| Hypothesis | What killed it |
+|---|---|
+| The phone cannot do wireless Android Auto | The same phone runs it in another car's factory head unit without stuttering |
+| The H.264 decoder blocks the read loop | Instrumented: `decode max` 0 to 11 ms, `slow=0`, average 0 ms, including during collapse |
+| The app fails writing to the dongle | `sendDropped=0` and `sendFailed=0` in every session |
+| Resolution or codec is wrong | The real SPS says H.264 Baseline L3.1, **800x480**, zero B frames. Already correct |
+| USB re-enumeration proves a defective dongle | It is the normal watchdog. With a host heartbeat it stops. See "The dongle re-enumerates constantly" |
+| Unpairing Bluetooth sent media over Bluetooth | The dongle's Bluetooth profile offers only a calls toggle, no A2DP. Media stays on Android Auto over Wi-Fi |
+| A HondaPermissions change caused it | The whitelist is byte identical in good and bad sessions |
+| Newer firmware exists | The manufacturer's endpoint returns an empty version and size 0 |
+| `AudioTrack.write` blocks the USB thread | A dedicated worker was implemented. Queue stayed `q=0, qmax=1, qdrop=0`. Better architecture, same symptom |
+| Access point band steering | Reported disabled on the access point |
+
+⚠️ The pattern in that list is worth more than any single row. **Five of the ten fell to a counter
+added specifically to test them**: decode timing, the write path counters, the SPS parse, the
+whitelist log line, and the audio queue metrics. The other five fell to a targeted probe rather
+than to argument: the manufacturer's update endpoint, the dongle's Bluetooth profile, the access
+point configuration, the dongle watchdog behaviour on a bench host, and running the same phone in
+another car.
+
+None of them fell to reasoning. The two that reasoning alone would have kept alive, the decoder and
+this app's write path, were the two leading theories at the time.
+
+## The stall detector, and why it only asks for a keyframe
+
+The existing watchdog deliberately fires only when **nothing** was ever received, because a dongle
+that goes quiet on a static screen is normal. That leaves a real failure uncovered: on 24/Aug the
+frame count froze at 2446 for 35 s with the phone still connected and the picture stuck, while
+every other indicator looked healthy.
+
+The threshold is 20 s, calibrated on 6 days of logs counting only stretches with the phone
+connected and the screen owned by the app: 11 healthy sessions over 4 days never stalled past
+10 s, and the real freeze lasted 35 s. So 20 s is twice the worst healthy case and still catches
+the real one.
+
+It logs **before** acting, and the action is only a keyframe request, the same call already made
+when the head unit hands the screen back. There is no session restart on purpose: a wedged dongle
+needed a car power cycle in the 01/Aug tests, and this stall recovered on its own, so tearing the
+session down would be a guess with a real cost. The reverse gear defence once became a plausible
+trigger for the very crash it was written to prevent, which is why anything touching the video path
+has to be visible in the log first.
+
+## Where this stands
+
+The cause is isolated to the dongle ceasing to deliver PCM over Wi-Fi, intermittently. The app side
+is measured clean on every path that was suspect. Cable is proven stable over 17 and 41 minute
+runs, so a wired connection is the reliable workaround and a different dongle is the hardware
+option. Nothing in this app is known to be able to fix it, and the counters above are what would
+detect a regression if it ever is fixed.
