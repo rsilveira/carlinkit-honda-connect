@@ -49,6 +49,34 @@ stop = threading.Event()
 state = {"video": 0, "audio": 0, "phone": None, "last_cmd": "", "started": time.time(),
          "video_bytes": 0, "audio_streams": {}, "last_event": ""}
 
+# Per-window delivery metrics, mirroring the Android heartbeat so a bench run and a run in the
+# car produce the same numbers and can be compared directly.
+#
+# The window is 5 s because that is the app's HEARTBEAT_MS, and the reference figures come from
+# that cadence: 117 PCM messages per window with a median gap near 70 ms is healthy, while the
+# degraded state measured on 27/Aug ran 23 to 42 per window with gaps up to 4.6 s.
+#
+# last_pcm is deliberately NOT reset between windows: a silence that straddles the boundary is
+# exactly the event of interest, and resetting it would hide the worst gaps.
+WINDOW_S = 5.0
+win = {"start": time.time(), "pcm": 0, "bytes": 0, "gap_max": 0.0, "video": 0, "last_pcm": None}
+
+
+def window_tick(force=False):
+    """Emits one line per WINDOW_S with delivery rate and the largest silence seen."""
+    now = time.time()
+    if not force and now - win["start"] < WINDOW_S:
+        return
+    span = now - win["start"]
+    if win["pcm"] or win["video"]:
+        log("window | in=%d inBytes=%d maxGap=%dms video=%d over %.1fs"
+            % (win["pcm"], win["bytes"], int(win["gap_max"] * 1000), win["video"], span))
+    win["start"] = now
+    win["pcm"] = 0
+    win["bytes"] = 0
+    win["gap_max"] = 0.0
+    win["video"] = 0
+
 
 def log(msg):
     line = "[%s] %s" % (time.strftime("%H:%M:%S"), msg)
@@ -101,7 +129,11 @@ class Session:
         self.send_int_file("/tmp/charge_mode", 1)
         self.send_file("/etc/box_name", b"HondaHRV\0")
         self.send_int_file("/etc/android_work_mode", 1)   # essential for Android
-        self.send(0x19, ('{"mediaDelay":300,"syncTime":%d,"androidAutoSizeW":%d,'
+        # mediaDelay must match what the app sends, or a bench run is not comparable to a
+        # measurement taken in the car. The app sent 300 until 26/Aug, which is the bottom of
+        # the range and the value most prone to stuttering; the box documents 1000 as its own
+        # default. See docs/FINDINGS.md, "Wireless degradation".
+        self.send(0x19, ('{"mediaDelay":1000,"syncTime":%d,"androidAutoSizeW":%d,'
                          '"androidAutoSizeH":%d}'
                          % (int(time.time() * 1000), w, h)).encode("ascii"))
         for c in (1000, 25, 7, 23):
@@ -229,6 +261,7 @@ def main():
         if mtype == 0x06:                                  # VideoData
             state["video"] += 1
             state["video_bytes"] += len(payload)
+            win["video"] += 1
             vfh.write(payload[20:])                        # 20 bytes of metadata
             if state["video"] == 1:
                 log("FIRST VIDEO FRAME")
@@ -244,6 +277,16 @@ def main():
                     % (AUDIO_CMD.get(c, c), d, a, vol))
                 state["last_event"] = "audio:" + AUDIO_CMD.get(c, str(c))
             elif len(body) > 4:
+                # Real PCM, not an AudioCommand. Counted here so the window figures mean the
+                # same thing as the app's "in": delivery of playable audio, nothing else.
+                now = time.time()
+                if win["last_pcm"] is not None:
+                    gap = now - win["last_pcm"]
+                    if gap > win["gap_max"]:
+                        win["gap_max"] = gap
+                win["last_pcm"] = now
+                win["pcm"] += 1
+                win["bytes"] += len(body)
                 if key not in apcm:
                     fmt = FORMATS.get(d)
                     log("PCM starts %s %s" % (key, ("%dHz %dch" % fmt[:2]) if fmt else "?"))
@@ -267,10 +310,12 @@ def main():
             state["last_event"] = "UNPLUGGED"
             log("UNPLUGGED")
 
+        window_tick()
         if time.time() - last_status > 3:
             write_status(); last_status = time.time()
 
     # shutdown
+    window_tick(force=True)
     vfh.close()
     log("shutting down: %d video frames, %d audio msgs" % (state["video"], state["audio"]))
     if state["video"] == 0:
