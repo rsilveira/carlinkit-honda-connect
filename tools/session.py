@@ -16,6 +16,7 @@ Usage:
 Status:  captures/session-status.txt
 Log:     captures/session.log
 """
+import argparse
 import os
 import signal
 import struct
@@ -195,26 +196,62 @@ def open_device(retries=30):
     return None
 
 
+def abrir_e_iniciar(args, tentativas=6):
+    """Opens the dongle and completes the init, retrying if its watchdog resets mid-sequence.
+
+    Why this retry exists, measured on 01/09/2026: while no host is talking to it the dongle
+    reboots roughly every 11 s. A run that starts just before one of those resets dies partway
+    through the init with a USB error, which looked like a broken dongle and cost a control
+    experiment. The app on the head unit never sees this because it is always attached.
+    """
+    for n in range(1, tentativas + 1):
+        dev = open_device()
+        if dev is None:
+            log("ERROR: dongle not found")
+            return None, None
+        intf = dev.get_active_configuration()[(0, 0)]
+        ep_out = usb.util.find_descriptor(intf, custom_match=lambda e:
+            usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT).bEndpointAddress
+        ep_in = usb.util.find_descriptor(intf, custom_match=lambda e:
+            usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN).bEndpointAddress
+        try:
+            usb.util.claim_interface(dev, intf.bInterfaceNumber)
+        except usb.core.USBError:
+            pass
+        s = Session(dev, ep_in, ep_out)
+        try:
+            s.init(w=args.width, h=args.height, fps=args.fps)
+            return dev, s
+        except usb.core.USBError as e:
+            log("init failed on attempt %d/%d (%s); the dongle watchdog probably reset it, "
+                "retrying" % (n, tentativas, e))
+            time.sleep(3)
+    log("ERROR: could not complete the init after %d attempts" % tentativas)
+    return None, None
+
+
 def main():
+    # CLI so a configuration sweep is reproducible and each log says which settings produced
+    # it. Without this the fps was hardcoded and four runs of a sweep would be
+    # indistinguishable after the fact, which is how a comparison quietly becomes worthless.
+    ap = argparse.ArgumentParser(description="Drives the dongle from a PC and measures delivery.")
+    ap.add_argument("--fps", type=int, default=20, help="fps announced in the OPEN message")
+    ap.add_argument("--width", type=int, default=800)
+    ap.add_argument("--height", type=int, default=480)
+    ap.add_argument("--seconds", type=int, default=0, help="stop after N seconds, 0 = until Ctrl-C")
+    ap.add_argument("--tag", default="", help="label recorded in the log, e.g. the dongle bitRate")
+    args = ap.parse_args()
+
     os.makedirs(OUT, exist_ok=True)
     open(LOG, "w").close()
 
-    dev = open_device()
-    if dev is None:
-        log("ERROR: dongle not found")
+    log("run config | fps=%d size=%dx%d seconds=%s tag=%s"
+        % (args.fps, args.width, args.height, args.seconds or "unbounded", args.tag or "-"))
+    dev, s = abrir_e_iniciar(args)
+    if s is None:
         return 1
-    intf = dev.get_active_configuration()[(0, 0)]
-    ep_out = usb.util.find_descriptor(intf, custom_match=lambda e:
-        usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_OUT).bEndpointAddress
-    ep_in = usb.util.find_descriptor(intf, custom_match=lambda e:
-        usb.util.endpoint_direction(e.bEndpointAddress) == usb.util.ENDPOINT_IN).bEndpointAddress
-    try:
-        usb.util.claim_interface(dev, intf.bInterfaceNumber)
-    except usb.core.USBError:
-        pass
-
-    s = Session(dev, ep_in, ep_out)
-    s.init()
+    if args.seconds:
+        threading.Timer(args.seconds, stop.set).start()
     threading.Thread(target=s.heartbeat_loop, daemon=True).start()
     threading.Thread(target=s.reconnect_loop, daemon=True).start()
 
