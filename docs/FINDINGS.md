@@ -586,3 +586,119 @@ is measured clean on every path that was suspect. Cable is proven stable over 17
 runs, so a wired connection is the reliable workaround and a different dongle is the hardware
 option. Nothing in this app is known to be able to fix it, and the counters above are what would
 detect a regression if it ever is fixed.
+
+---
+
+# The bench rig: what it validates, and what it cannot (Sep 1, 2026)
+
+`tools/session.py` drives the dongle from a PC over USB, with no head unit and no
+Android app involved. It now reports the same per-window figures as the app's heartbeat,
+so bench and car numbers are directly comparable.
+
+## Validated against the car, over a cable
+
+```
+                        in_med   gap_med   gap_max   windows over 500 ms
+car, cable, 17 min        117      71 ms    228 ms   0
+bench, cable, 3.9 min     117      67 ms    191 ms   0 of 47
+```
+
+Number for number. The rig is therefore trustworthy for anything that travels over the
+cable, and a bench result can stand in for a drive.
+
+That also settles a doubt raised while investigating: the harness has no protocol defect.
+It held an Android Auto session for 3.9 minutes with a single PLUGGED, zero UNPLUGGED and
+continuous media. Its init sequence, all 14 config fields, its command set and its
+heartbeat cadence are identical to the app's, checked field by field.
+
+## Wireless on the bench fails differently from the car
+
+```
+                    drops/min   in_med   gap_med   gap_max   windows over 500 ms
+car, degraded            0.00      42     131 ms   4578 ms   26 of 54
+bench, wireless          2.73      58      90 ms     94 ms    0 of 4
+bench, cable             0.00     117      67 ms    191 ms    0 of 47
+```
+
+The car's degraded sessions had **zero** phone drops with continuous media and starved
+delivery. The bench has the opposite: while connected the delivery is clean, and the
+session dies every 12 seconds.
+
+⚠️ **The 12 s figure is regular, so it is a timeout and not interference**, and the event
+order says who decides: `UNPLUGGED` arrives first and `btDisconnected` follows, so the
+dongle drops the phone and only then releases Bluetooth. Cause not found. It is specific to
+the wireless path, since the same code over a cable holds the session indefinitely.
+
+Ruled out for that drop, each by measurement: a protocol gap against the app, USB resets
+(zero kernel events during the runs), supply current (the hub is self-powered), the phone
+leaving for the house network (zero DHCP and zero association at the gateway, checked in
+two separate windows), distance and placement, and `REQUEST_VIDEO_FOCUS`, which exists as
+a constant and the app does not send either.
+
+## The Wi-Fi channel cannot be changed
+
+The dongle exposes `WiFiChannel` and value 1 corresponds to channel 36. Writing it is
+accepted and silently ignored:
+
+```
+item=bitRate       err=0    4 -> 5 -> 4   writes, confirmed by read-back
+item=WiFiChannel   err=0    1 -> 1        accepted and IGNORED
+item=wifiChannel   err=255                name not recognised
+```
+
+The three outcomes are distinguishable, and only a read-back separates "accepted" from
+"applied". `bitRate` is the control that proves the syntax works. Channel width is not
+exposed at all, so neither of the two settings that would help in a congested band can be
+reached.
+
+For the record, measured where the bench sits: the 80 MHz block the dongle is locked to,
+36 to 48, carries 5 access points including a hidden one on channel 40 at maximum signal,
+while the non-DFS block 149 to 165 carries 2. So the RF case is real and unreachable.
+
+The write path is POST multipart to `/cgi-bin/server.cgi` with `cmd`, `item` and `val`. A
+query string returns `err=255`.
+
+## Amazon Music and YouTube Music deliver the same
+
+Same dongle, same cable, same settings, 3.9 minutes each:
+
+```
+                p50    p75    p90    p95    max     over 200 ms   drops
+YouTube Music   67ms   69ms  178ms  184ms  191ms         0          0
+Amazon Music    68ms   73ms  188ms  192ms  268ms         2          0
+```
+
+Both negotiate 48000 Hz stereo, decodeType 4. Amazon is marginally worse at the tail and
+the difference is milliseconds against a degraded reference of 4578 ms. Whatever is heard
+as a small stutter with Amazon Music is not a delivery difference.
+
+## ⚠️ The rig measures delivery, not playback
+
+It writes PCM to a file. It does not exercise the app's audio worker or the head unit's
+speakers. So a clean bench result does not clear those two, and a small stutter with clean
+delivery points at one of them.
+
+## Reading the next drive's log
+
+With media playing and the picture live, the heartbeat answers this without further tooling:
+
+| Reading | Conclusion |
+|---|---|
+| `in` near 117, `maxGap` low, yet it stutters | delivery is fine: playback, the audio worker or the head unit |
+| `in` falling and `maxGap` in seconds | delivery, the failure measured on 27/Aug |
+| `qdrop` climbing above zero | the app's own audio worker, and the first time it would have happened |
+| `sendDropped` or `sendFailed` non-zero | the app's write path to the dongle |
+| `decode max` high or `slow` non-zero | the decoder throttling the read loop |
+
+`qdrop` stayed at zero across the 365 windows of the clean 30 minute session on 27/Aug, and
+that session was YouTube Music.
+
+## Running it
+
+```bash
+cd android/..                       # repository root
+sudo ./venv/bin/python tools/session.py --seconds 240 --tag "what-you-changed"
+```
+
+Anything associated to the dongle's own access point consumes airtime on the very link
+being measured, so nothing else should be joined to it during a run.
