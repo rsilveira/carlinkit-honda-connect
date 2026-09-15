@@ -60,6 +60,31 @@ public final class CarlinkitAudioPlayer {
     private long audioInputLastNs;
     private volatile int audioTrackBufferBytes;
 
+    /**
+     * How much audio is still buffered ahead of the speaker, in milliseconds.
+     *
+     * Why this exists: every other counter in this class stops at {@code AudioTrack.write()}, so a
+     * session with clean delivery and audible stutter was indistinguishable from a session with
+     * clean delivery and no stutter. Measured in the car on 03/09: 130 minutes of music with
+     * in=117 per window (the theoretical maximum), qdrop=0, errors=0, and the driver still heard
+     * short interruptions. Delivery was therefore not the problem, and nothing measured what
+     * happened after the write.
+     *
+     * {@code AudioTrack.getUnderrunCount()} would answer this directly but needs API 24, and this
+     * head unit reports Android 4.0.4 (API 15), so the fill is derived from
+     * {@code getPlaybackHeadPosition()} instead, which exists since API 3.
+     *
+     * The number to compare against is the buffer depth: 65536 B at 48000 Hz stereo 16 bit is
+     * 16384 frames, or 341 ms. Delivery gaps measured the same day reached 286 ms, 84% of it.
+     */
+    private long audioFillLastMs = -1;
+    private long audioFillMinMs = -1;
+    /** Frames written per decodeType, in a one-element box because API 15 has no compute(). */
+    private final java.util.Map<Integer, long[]> trackFrames =
+            new java.util.HashMap<Integer, long[]>();
+    private int currentFrameBytes;
+    private int currentSampleRate;
+
     /** Runs on the USB read loop before the payload is copied into the worker queue. */
     private synchronized void recordAudioInput(int bytes) {
         long now = System.nanoTime();
@@ -109,6 +134,8 @@ public final class CarlinkitAudioPlayer {
                       + " avg=" + (audioWriteTotalMs / audioWriteCount) + "ms")
                 + (audioWritePartialCount > 0 ? " partial=" + audioWritePartialCount : "")
                 + (audioWriteErrorCount > 0 ? " errors=" + audioWriteErrorCount : "")
+                + (audioFillLastMs < 0 ? ""
+                    : " fill=" + audioFillLastMs + "ms min=" + audioFillMinMs + "ms")
                 + (workerProblem != null ? " worker=" + workerProblem : "");
         audioWriteCount = 0;
         audioWriteTotalMs = 0;
@@ -116,6 +143,9 @@ public final class CarlinkitAudioPlayer {
         audioWriteSlowCount = 0;
         audioWritePartialCount = 0;
         audioWriteErrorCount = 0;
+        // The minimum restarts each window; keeping the session minimum would freeze on the first
+        // dip and stop showing whether the fill recovers or keeps sliding down.
+        audioFillMinMs = audioFillLastMs;
         audioInputCount = 0;
         audioInputBytes = 0;
         audioInputMaxGapMs = 0;
@@ -324,6 +354,11 @@ public final class CarlinkitAudioPlayer {
             }
         }
         tracks.clear();
+        synchronized (this) {
+            trackFrames.clear();
+            audioFillLastMs = -1;
+            audioFillMinMs = -1;
+        }
         activeTrackCount = 0;
         track = null;
         currentDecodeType = -1;
@@ -350,6 +385,7 @@ public final class CarlinkitAudioPlayer {
         if (existing != null) {
             track = existing;
             currentDecodeType = decodeType;
+            adoptFormat(decodeType);
             if (!muted) {
                 try {
                     track.play();
@@ -396,6 +432,7 @@ public final class CarlinkitAudioPlayer {
             audioTrackBufferBytes = bufSize;
             track = fresh;
             currentDecodeType = decodeType;
+            adoptFormat(decodeType);
             // In the file log too: the format the dongle SENDS is the best available clue to
             // the format it EXPECTS back from the microphone. On 10/Aug this line reported
             // 8000Hz during a call while the microphone was sending 16000Hz upstream, which is
@@ -614,6 +651,7 @@ public final class CarlinkitAudioPlayer {
         }
         if (n > 0) {
             bytesWritten += n;
+            recordFill(n);
             if (n != expected) {
                 audioWritePartialCount++;
             }
@@ -622,6 +660,71 @@ public final class CarlinkitAudioPlayer {
             if (!threw) {
                 Log.e(TAG, "AudioTrack.write returned " + n);
             }
+        }
+    }
+
+    /**
+     * Remembers the frame geometry of the format now playing, and makes sure it has a counter.
+     *
+     * Frame size and sample rate are cached instead of being looked up per write because the write
+     * path runs 23 times a second per stream and {@code formatOf} allocates.
+     */
+    private void adoptFormat(int decodeType) {
+        AudioMessage.Format f = AudioMessage.formatOf(decodeType);
+        if (f == null) {
+            currentFrameBytes = 0;
+            currentSampleRate = 0;
+            return;
+        }
+        currentFrameBytes = f.channels * (f.bitsPerSample / 8);
+        currentSampleRate = f.sampleRate;
+        Integer key = Integer.valueOf(decodeType);
+        if (trackFrames.get(key) == null) {
+            trackFrames.put(key, new long[1]);
+        }
+    }
+
+    /**
+     * Updates how far ahead of the speaker the buffer is, from the frames actually consumed.
+     *
+     * {@code getPlaybackHeadPosition()} counts frames rendered by this track since it was created
+     * or last flushed, so the written-frames counter has to be reset at every flush site or the
+     * difference drifts upwards forever. It is a 32-bit frame count, hence the unsigned handling:
+     * it wraps after about 24 h of playback on a single track, well past any drive, but a wrap
+     * without the mask would read as a hugely negative fill.
+     */
+    private void recordFill(int bytes) {
+        AudioTrack t = track;
+        if (t == null || currentFrameBytes <= 0 || currentSampleRate <= 0) {
+            return;
+        }
+        long[] box = trackFrames.get(Integer.valueOf(currentDecodeType));
+        if (box == null) {
+            return;
+        }
+        box[0] += bytes / currentFrameBytes;
+        long head;
+        try {
+            head = t.getPlaybackHeadPosition() & 0xFFFFFFFFL;
+        } catch (Throwable ignored) {
+            return;
+        }
+        long fillFrames = (box[0] & 0xFFFFFFFFL) - head;
+        if (fillFrames < 0) {
+            fillFrames += 0x100000000L;
+        }
+        long fillMs = fillFrames * 1000L / currentSampleRate;
+        audioFillLastMs = fillMs;
+        if (audioFillMinMs < 0 || fillMs < audioFillMinMs) {
+            audioFillMinMs = fillMs;
+        }
+    }
+
+    /** After a flush the track restarts its frame count from zero, so ours must too. */
+    private synchronized void resetFrames(int decodeType) {
+        long[] box = trackFrames.get(Integer.valueOf(decodeType));
+        if (box != null) {
+            box[0] = 0;
         }
     }
 
@@ -635,6 +738,16 @@ public final class CarlinkitAudioPlayer {
                     t.play();
                 }
             } catch (Throwable ignored) {
+            }
+        }
+        if (value) {
+            // Muting flushes every track, so every frame counter restarts from zero as well.
+            synchronized (this) {
+                for (long[] box : trackFrames.values()) {
+                    box[0] = 0;
+                }
+                audioFillLastMs = -1;
+                audioFillMinMs = -1;
             }
         }
     }
@@ -658,6 +771,7 @@ public final class CarlinkitAudioPlayer {
                         stopped.flush();
                     } catch (Throwable ignored) {
                     }
+                    resetFrames(decodeType);
                 }
                 break;
             default:
