@@ -5,6 +5,8 @@ import android.os.Environment;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
 import java.io.FileReader;
 import java.io.FileWriter;
 import java.io.PrintWriter;
@@ -42,6 +44,25 @@ public final class CarlinkitFileLog {
     /** Hard cap for the whole log directory. */
     private static final long MAX_DIR_BYTES = 4L * 1024 * 1024;
 
+    /**
+     * Matches the log files this class writes. Shared by the rotation and the rescue so that
+     * a change to the naming cannot leave one of them behind.
+     */
+    private static final java.io.FilenameFilter LOG_FILES = new java.io.FilenameFilter() {
+        @Override
+        public boolean accept(File d, String name) {
+            return name.startsWith("carlinkit-") && name.endsWith(".log");
+        }
+    };
+
+    /** Oldest first: the name carries a sortable timestamp (yyyyMMdd-HHmmss). */
+    private static final java.util.Comparator<File> BY_NAME = new java.util.Comparator<File>() {
+        @Override
+        public int compare(File a, File b) {
+            return a.getName().compareTo(b.getName());
+        }
+    };
+
     /** Hints that a mount point is removable USB storage. */
     private static final String[] USB_HINTS = {
             "usb", "udisk", "sda", "sdb", "otg", "removable"
@@ -76,12 +97,20 @@ public final class CarlinkitFileLog {
     private File file;
     private String targetKind = "?";
     private int prunedCount;
+    private int rescuedCount;
+    private long rescuedBytes;
 
     private CarlinkitFileLog(Context ctx) {
         List<String> diag = new ArrayList<String>();
         File dir = chooseTarget(ctx, diag);
         try {
             if (dir != null) {
+                // Pull out whatever a previous run left on storage this head unit does not
+                // expose. Runs before the rotation on purpose: the caps then apply to the
+                // merged set, and the oldest of the two origins is the one that gives way.
+                if ("USB flash drive".equals(targetKind)) {
+                    rescueStrandedLogs(ctx, dir);
+                }
                 // A new file is created on every app start, so old ones must be pruned or
                 // they accumulate forever on the head unit's small data partition.
                 pruneOldLogs(dir);
@@ -101,6 +130,10 @@ public final class CarlinkitFileLog {
                 + " (" + targetKind + ")");
         if (prunedCount > 0) {
             writeLine("pruned " + prunedCount + " old log file(s)");
+        }
+        if (rescuedCount > 0) {
+            writeLine("rescued " + rescuedCount + " log file(s), " + rescuedBytes
+                    + " B, from storage this head unit does not expose");
         }
         // The full mount diagnostics only matter when the preferred target was not used:
         // it accounted for a third of the log volume and its job (finding out that the USB
@@ -252,22 +285,11 @@ public final class CarlinkitFileLog {
      */
     private void pruneOldLogs(File dir) {
         try {
-            File[] logs = dir.listFiles(new java.io.FilenameFilter() {
-                @Override
-                public boolean accept(File d, String name) {
-                    return name.startsWith("carlinkit-") && name.endsWith(".log");
-                }
-            });
+            File[] logs = dir.listFiles(LOG_FILES);
             if (logs == null || logs.length == 0) {
                 return;
             }
-            // Oldest first: the name carries a sortable timestamp (yyyyMMdd-HHmmss)
-            java.util.Arrays.sort(logs, new java.util.Comparator<File>() {
-                @Override
-                public int compare(File a, File b) {
-                    return a.getName().compareTo(b.getName());
-                }
-            });
+            java.util.Arrays.sort(logs, BY_NAME);
             long total = 0;
             for (File f : logs) {
                 total += f.length();
@@ -287,6 +309,138 @@ public final class CarlinkitFileLog {
             }
         } catch (Throwable ignored) {
             // Housekeeping must never break logging
+        }
+    }
+
+    /**
+     * Copies logs left behind on storage the head unit does not expose over to the flash drive.
+     *
+     * <p>A run started without the flash drive still logs, but it lands on internal or app
+     * storage. There is no adb here, so that file is unreadable in practice, and
+     * {@link #pruneOldLogs(File)} eventually deletes it: after 15 app starts the evidence of
+     * a whole drive is gone. Observed once for real, a full trip logged with no drive plugged
+     * in, and the file could not be retrieved. This turns forgetting the drive into a delayed
+     * log instead of a lost one.
+     *
+     * <p>The original is only unlinked after the copy is proven complete by length, so a
+     * failure halfway costs a duplicate attempt on the next run, never the file.
+     */
+    private void rescueStrandedLogs(Context ctx, File dest) {
+        try {
+            List<File> sources = new ArrayList<File>();
+            try {
+                sources.add(new File(ctx.getFilesDir(), DIR_NAME));
+            } catch (Throwable ignored) {
+            }
+            try {
+                File appExt = ctx.getExternalFilesDir(null);
+                if (appExt != null) {
+                    sources.add(new File(appExt, DIR_NAME));
+                }
+            } catch (Throwable ignored) {
+            }
+            try {
+                File ext = Environment.getExternalStorageDirectory();
+                if (ext != null) {
+                    sources.add(new File(ext, DIR_NAME));
+                }
+            } catch (Throwable ignored) {
+            }
+
+            // Bounded by the same caps as the rotation: a rescue must not fill the drive.
+            long budget = MAX_DIR_BYTES;
+            for (File src : sources) {
+                if (rescuedCount >= MAX_FILES || budget <= 0) {
+                    break;
+                }
+                // On some head units the external root IS the flash drive, and then source and
+                // destination are the same directory. Copying it onto itself would delete it.
+                if (!src.isDirectory() || sameDir(src, dest)) {
+                    continue;
+                }
+                File[] logs = src.listFiles(LOG_FILES);
+                if (logs == null || logs.length == 0) {
+                    continue;
+                }
+                java.util.Arrays.sort(logs, BY_NAME);
+                for (File f : logs) {
+                    if (rescuedCount >= MAX_FILES || budget <= 0) {
+                        break;
+                    }
+                    long len = f.length();
+                    if (len <= 0 || len > budget) {
+                        continue;
+                    }
+                    File target = new File(dest, f.getName());
+                    if (target.exists()) {
+                        // Already rescued on an earlier run: drop the original and move on.
+                        f.delete();
+                        continue;
+                    }
+                    if (moveVerified(f, target, len)) {
+                        rescuedCount++;
+                        rescuedBytes += len;
+                        budget -= len;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+            // Housekeeping must never break logging
+        }
+    }
+
+    /**
+     * Copies {@code src} to {@code dest} and only then removes the original.
+     *
+     * Writes to a sibling {@code .part} first: a half written file never takes the final name,
+     * so an interrupted copy cannot be mistaken for a complete log.
+     *
+     * @return true only when the destination holds all {@code expected} bytes
+     */
+    private static boolean moveVerified(File src, File dest, long expected) {
+        File part = new File(dest.getAbsolutePath() + ".part");
+        FileInputStream in = null;
+        FileOutputStream out = null;
+        boolean copied = false;
+        try {
+            in = new FileInputStream(src);
+            out = new FileOutputStream(part);
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                out.write(buf, 0, n);
+            }
+            out.flush();
+            copied = true;
+        } catch (Throwable ignored) {
+        } finally {
+            closeQuietly(in);
+            closeQuietly(out);
+        }
+        // The length check runs after the close, otherwise it could read a short file that is
+        // merely still buffered.
+        if (!copied || part.length() != expected || !part.renameTo(dest)) {
+            part.delete();
+            return false;
+        }
+        src.delete();
+        return true;
+    }
+
+    private static void closeQuietly(java.io.Closeable c) {
+        if (c != null) {
+            try {
+                c.close();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private static boolean sameDir(File a, File b) {
+        try {
+            return a.getCanonicalPath().equals(b.getCanonicalPath());
+        } catch (Throwable t) {
+            return a.getAbsolutePath().equals(b.getAbsolutePath());
         }
     }
 
