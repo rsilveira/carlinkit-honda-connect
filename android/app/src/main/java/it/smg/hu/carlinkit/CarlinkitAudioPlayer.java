@@ -79,6 +79,10 @@ public final class CarlinkitAudioPlayer {
      */
     private long audioFillLastMs = -1;
     private long audioFillMinMs = -1;
+    /** How many readings had to be thrown away in this window because of counter drift. */
+    private int audioFillResyncCount;
+    /** Returned by {@link #fillFrames} when the two counters cannot be compared. */
+    private static final long FILL_DESYNC = Long.MIN_VALUE;
     /** Frames written per decodeType, in a one-element box because API 15 has no compute(). */
     private final java.util.Map<Integer, long[]> trackFrames =
             new java.util.HashMap<Integer, long[]>();
@@ -136,6 +140,7 @@ public final class CarlinkitAudioPlayer {
                 + (audioWriteErrorCount > 0 ? " errors=" + audioWriteErrorCount : "")
                 + (audioFillLastMs < 0 ? ""
                     : " fill=" + audioFillLastMs + "ms min=" + audioFillMinMs + "ms")
+                + (audioFillResyncCount > 0 ? " fillResync=" + audioFillResyncCount : "")
                 + (workerProblem != null ? " worker=" + workerProblem : "");
         audioWriteCount = 0;
         audioWriteTotalMs = 0;
@@ -146,6 +151,7 @@ public final class CarlinkitAudioPlayer {
         // The minimum restarts each window; keeping the session minimum would freeze on the first
         // dip and stop showing whether the fill recovers or keeps sliding down.
         audioFillMinMs = audioFillLastMs;
+        audioFillResyncCount = 0;
         audioInputCount = 0;
         audioInputBytes = 0;
         audioInputMaxGapMs = 0;
@@ -693,6 +699,35 @@ public final class CarlinkitAudioPlayer {
      * it wraps after about 24 h of playback on a single track, well past any drive, but a wrap
      * without the mask would read as a hugely negative fill.
      */
+    /**
+     * Frames still buffered ahead of the speaker, or {@link #FILL_DESYNC} when the two
+     * counters cannot be compared.
+     *
+     * Both a 32 bit wrap and a pair of counters that drifted apart show up as a negative
+     * difference, and they need opposite treatment. A wrap needs the written count to have
+     * reached the top of the range, which takes about 24 h of playback on a single track,
+     * so it cannot happen early in a drive. Everything else negative is drift: a flush
+     * resets {@code getPlaybackHeadPosition()} and our own count at slightly different
+     * moments, and then the head briefly reads ahead of what we believe we wrote.
+     *
+     * Treating drift as a wrap is what ruined the measurement. In the logs of 16/09, 559
+     * of 612 readings came out around 89419669 ms against a 341 ms buffer, and 89419669 ms
+     * is 2^32 frames minus a little: almost every reading was a few frames of drift being
+     * inflated by four billion.
+     *
+     * Static and free of side effects so the arithmetic can be tested on its own.
+     */
+    static long fillFrames(long written, long head) {
+        long diff = (written & 0xFFFFFFFFL) - head;
+        if (diff >= 0) {
+            return diff;
+        }
+        if ((written & 0xFFFFFFFFL) > 0xF0000000L) {
+            return diff + 0x100000000L;      // genuine wrap near the top of the range
+        }
+        return FILL_DESYNC;
+    }
+
     private void recordFill(int bytes) {
         AudioTrack t = track;
         if (t == null || currentFrameBytes <= 0 || currentSampleRate <= 0) {
@@ -709,11 +744,15 @@ public final class CarlinkitAudioPlayer {
         } catch (Throwable ignored) {
             return;
         }
-        long fillFrames = (box[0] & 0xFFFFFFFFL) - head;
-        if (fillFrames < 0) {
-            fillFrames += 0x100000000L;
+        long frames = fillFrames(box[0], head);
+        if (frames == FILL_DESYNC) {
+            // Line the count up with the track and let the next writes rebuild the figure,
+            // instead of reporting a number that is four billion frames wrong.
+            box[0] = head;
+            audioFillResyncCount++;
+            return;
         }
-        long fillMs = fillFrames * 1000L / currentSampleRate;
+        long fillMs = frames * 1000L / currentSampleRate;
         audioFillLastMs = fillMs;
         if (audioFillMinMs < 0 || fillMs < audioFillMinMs) {
             audioFillMinMs = fillMs;
