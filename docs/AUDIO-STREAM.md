@@ -130,6 +130,26 @@ Points to watch:
    - The buffer handed in by the driver is **reused**, so the worker has to copy it. A pool keeps
      that from becoming roughly 50 allocations a second at 48 kHz stereo.
 
+5. **How full the buffer is, and why it is worth logging.** Every other counter in this path stops
+   at `AudioTrack.write()`, so a session with clean delivery and audible stutter used to be
+   indistinguishable from a clean one. `AudioTrack.getUnderrunCount()` answers it directly but
+   needs API 24, so the figure is derived from `getPlaybackHeadPosition()`, available since API 3:
+   frames written minus frames rendered. It shows on the heartbeat as `fill=Nms min=Nms`.
+
+   The number to compare against is the buffer depth, which for 65536 bytes at 48 kHz stereo
+   16 bit is 16384 frames, or **341 ms**. Measured over 518 windows on 19/Sep 2026 the buffer sat
+   between 92% and 97% full in four of five sessions, and the lowest instant of the whole day was
+   144 ms, in a fifth session whose median was 154 ms and which is unexplained. Even that is 42%
+   of the buffer, so playback was never starved.
+
+   ⚠️ `getPlaybackHeadPosition()` restarts at every flush, so the written frame counter has to
+   restart with it or the difference drifts upward forever. Both flush sites reset it: the mute
+   path zeroes every track, and the stop command resets the one it flushed. A negative difference
+   is **not** normally a 32 bit wrap, it is the two counters having drifted apart, and treating it
+   as a wrap produced readings around 89419669 ms in 91% of samples. Discarded readings are
+   counted as `fillResync=N` rather than hidden. The reasoning and the numbers are in
+   [FINDINGS.md](FINDINGS.md), section "Delivery was never the problem".
+
 ## Whether phone calls reach this code path depends on the Bluetooth pairing
 
 The `PhonecallStart`/`PhonecallStop` commands and the 8 kHz mono format exist in the protocol, and

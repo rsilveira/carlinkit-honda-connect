@@ -511,8 +511,19 @@ alive | dongle sending=true phone=unknown video rx=N rendered=M connectReq=N
 | `decode max` large or `slow` non zero | the decoder is throttling the read loop |
 | `sendDropped` or `sendFailed` non zero | the app's own write path to the dongle is failing |
 
-`in` counts PCM messages per 5 s interval, so 117 is the healthy figure at 48 kHz stereo, roughly
-23 per second.
+⚠️ **Do not read `in` against a fixed number.** This section used to say 117 was the healthy
+figure, which held only while the phone delivered 8192 byte messages. From 14/Sep 2026 the same
+phone started delivering 15360 byte messages, so the healthy figure became 63 and a reading of
+117 would now mean something changed. What stays constant is the byte rate, because the audio
+rate is fixed:
+
+```
+8192 B per message   ->  in = 117 per 5 s window   191693 B/s   1.00x of 48 kHz stereo 16 bit
+15360 B per message  ->  in =  63 per 5 s window   193536 B/s   1.01x
+```
+
+Check `inBytes` divided by `in` first to learn the message size, then judge `in` against the
+size in use. See the section on the packet size for what changes it.
 
 ## Measured signatures
 
@@ -684,11 +695,14 @@ With media playing and the picture live, the heartbeat answers this without furt
 
 | Reading | Conclusion |
 |---|---|
-| `in` near 117, `maxGap` low, yet it stutters | delivery is fine: playback, the audio worker or the head unit |
+| `in` at the rate for the message size, `maxGap` low, yet it stutters | delivery is fine: playback, the audio worker or the head unit |
 | `in` falling and `maxGap` in seconds | delivery, the failure measured on 27/Aug |
 | `qdrop` climbing above zero | the app's own audio worker, and the first time it would have happened |
 | `sendDropped` or `sendFailed` non-zero | the app's write path to the dongle |
 | `decode max` high or `slow` non-zero | the decoder throttling the read loop |
+
+The expected `in` depends on the message size the phone is using, 117 for 8192 byte messages and
+63 for 15360 byte ones. Divide `inBytes` by `in` before judging either.
 
 `qdrop` stayed at zero across the 365 windows of the clean 30 minute session on 27/Aug, and
 that session was YouTube Music.
@@ -702,3 +716,133 @@ sudo ./venv/bin/python tools/session.py --seconds 240 --tag "what-you-changed"
 
 Anything associated to the dongle's own access point consumes airtime on the very link
 being measured, so nothing else should be joined to it during a run.
+
+# Delivery was never the problem: the buffer, measured (Sep 14 to 19, 2026)
+
+Every counter above stops at `AudioTrack.write()`. A session with clean delivery and audible
+stutter was therefore indistinguishable from a clean session, and that ambiguity had been open
+since August. This section closes it, and along the way two hypotheses about the cause turned
+out to be wrong.
+
+## The buffer never runs dry
+
+`AudioTrack.getUnderrunCount()` would answer this directly but needs API 24, and this head unit
+reports API 15, so the figure is derived from `getPlaybackHeadPosition()`, available since API 3:
+frames written minus frames rendered, converted to milliseconds. It appears on the heartbeat as
+`fill=Nms min=Nms`, the current value and the lowest of the window.
+
+The number to compare against is the buffer depth. 65536 bytes at 48 kHz stereo 16 bit is 16384
+frames, which is **341 ms**.
+
+Measured across five sessions on 19/Sep, 518 windows:
+
+| Session | fill min | fill median | fill max |
+|---|---|---|---|
+| 12:32:18 | 314 | 320 | 325 |
+| 12:32:54 | 304 | 330 | 341 |
+| 12:39:31 | 288 | 314 | 330 |
+| 13:30:01 | 277 | 320 | 336 |
+| 14:03:00 | 144 | 154 | 314 |
+
+In four of the five the buffer sits between 92% and 97% full, and the worst instant among those
+four was 277 ms out of 341. Counting the fifth session the worst instant of the day was 144 ms,
+which is 42% of the buffer and still nowhere near empty. **There is no underrun.** Whatever the
+driver heard, the audio was not running out in the buffer after the write.
+
+The fifth session is the one anomaly worth carrying forward: a median of 154 ms, under half the
+buffer, and the only window of the day whose gap exceeded the buffer depth at 715 ms. It is a
+short session, 34 windows, and it is unexplained.
+
+## ⚠️ The first version of that measurement was 91% garbage
+
+Before trusting the table above, the arithmetic had to be fixed. The original code treated any
+negative difference between written and rendered frames as a 32 bit wrap and added 2^32:
+
+```java
+long fillFrames = (box[0] & 0xFFFFFFFFL) - head;
+if (fillFrames < 0) {
+    fillFrames += 0x100000000L;          // assumed a wrap, every time
+}
+```
+
+In the logs of 16/Sep, 559 of 612 readings came out around 89419669 ms against a 341 ms buffer.
+That figure is 2^32 frames minus 2823184, which is 58 seconds of audio: the playback head was
+running a minute ahead of the frames we believed we had written, because a flush resets
+`getPlaybackHeadPosition()` and our own count at slightly different moments.
+
+A real wrap needs the written count to have climbed to the top of the range, which takes about
+24 h of playback on one track, so it cannot appear early in a drive. The arithmetic now only
+treats a difference as a wrap when the written count is actually up there, and otherwise reports
+drift, lines the count up with the track, and drops the reading. Dropped readings appear as
+`fillResync=N` on the heartbeat, because a measurement that silently discards 91% of its samples
+looks exactly like a healthy one.
+
+⚠️ **The resync path has not been exercised in the field.** On 19/Sep the count was zero in all
+five sessions, and the reason shows in the flush counters: `MediaStop`, `OutputStop` and mute
+were all zero, so the condition that desynchronises the counters never occurred. The absurd
+values are gone, but that is not yet proof the repair works. A drive with the music paused, or a
+call, is what will test it.
+
+## The PCM message size changed, and it comes from the phone
+
+Delivery got dramatically more regular between the August measurements and 19/Sep, and the cause
+is not in this app, not in the USB port, and not in the connection mode.
+
+```
+until 14/Sep 17:09   8192 B per message   in = 117 per window
+from  14/Sep 17:09  15360 B per message   in =  63 per window
+```
+
+15360 bytes is 3840 frames, or **exactly 80.00 ms** of audio at 48 kHz stereo 16 bit. 8192 bytes
+is 42.67 ms. A round 80 ms block is an audio buffer size chosen on the phone side, not something
+a USB socket produces.
+
+Effect on the delivery distribution, in balanced samples:
+
+| Sample | packet | p50 | p90 | p99 | max | windows over 341 ms |
+|---|---|---|---|---|---|---|
+| 176 min over a cable, to 14/Sep | 8192 B | 71 ms | 184 ms | 228 ms | 15573 ms | 2.73 per hour |
+| 177 min over Wi-Fi, to 16/Sep | 15360 B | 91 ms | 107 ms | 420 ms | 39727 ms | 7.45 per hour |
+| 5 sessions on 19/Sep | 15360 B | 99 ms | 108 ms | 135 ms | 148 ms | 1 in 518 windows |
+
+Larger blocks arrive further apart and far more evenly, which is why p90 fell by 42%. The tail is
+a separate question: it was still there in the 16/Sep Wi-Fi sample and it is gone on 19/Sep.
+
+### Two hypotheses this refuted
+
+**The USB port.** The dongle was moved from the second USB socket to the one nearest the driver on
+14/Sep, and the packet size changed the same afternoon, which made the port look causal. It is
+not: the size is an application level message length decided by the phone, and a socket does not
+change it.
+
+**Cable against Wi-Fi.** The file level correlation looked perfect, every session without
+`wifi connected` delivering 8192 and every session with it delivering 15360, until the same test
+was run *inside* each session:
+
+```
+03/Sep 16:57  wifi connected at 16:57:40  ->  253 windows at  8192 B
+14/Sep 17:08  wifi connected at 17:09:06  ->  1116 windows at 15360 B
+```
+
+Wi-Fi in both, different sizes. And on 19/Sep a session with no `wifi connected` at all, meaning
+a cable, delivered 15360 B. The mode is not the variable either.
+
+What remains is the phone: an Android Auto or platform update between 03/Sep and 14/Sep changed
+the audio block size. That cannot be confirmed from these logs, because the protocol carries no
+phone side version: the only identifying messages the dongle relays are `WifiDeviceName`,
+`BluetoothDeviceName`, `BluetoothPairedList` and `HiCarLink`, none with a version field.
+
+## Logs survive a drive without the flash drive
+
+A run started without the flash drive still logs, but the target falls back to app or internal
+storage, and there is no adb here, so the file was unreadable in practice and the rotation
+deleted it once 15 files piled up. Whenever the chosen target is a flash drive, any log left
+behind in the fallback locations is now moved onto it, with the copy checked by length before the
+original is unlinked.
+
+It paid for itself immediately: the first drive with the drive plugged in reported
+`rescued 15 log file(s), 1284493 B`, and those recovered files are the entire basis of the packet
+size finding above. They had been sitting in `app external storage`, the second fallback tier.
+
+⚠️ The rescue competes with the rotation for the 15 file budget, so recovering a backlog can push
+older logs off the drive. Copy them somewhere else before the next drive.
